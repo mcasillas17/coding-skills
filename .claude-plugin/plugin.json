@@ -1,0 +1,8 @@
+{
+  "name": "knights-of-the-round-table",
+  "version": "0.1.0",
+  "description": "Cross-harness implementation, review, documentation, and pull request skill",
+  "license": "MIT",
+  "skills": "./skills/",
+  "agents": "./generated/claude/agents/"
+}

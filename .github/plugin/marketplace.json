@@ -1,0 +1,16 @@
+{
+  "name": "knights-of-the-round-table",
+  "owner": {
+    "name": "coding-skills"
+  },
+  "plugins": [
+    {
+      "name": "knights-of-the-round-table",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Cross-harness implementation, review, documentation, and pull request skill",
+      "skills": "./skills/",
+      "agents": "./agents/"
+    }
+  ]
+}

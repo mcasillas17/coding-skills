@@ -337,7 +337,7 @@ test("configuration enforces the hard round cap and single retry", () => {
   }
 });
 
-test("validator CLI reports the successful reviewer and harness counts", () => {
+test("validator CLI reports repository component counts by default", () => {
   const result = spawnSync(process.execPath, ["scripts/validate.mjs"], {
     cwd: new URL("..", import.meta.url),
     encoding: "utf8",
@@ -346,7 +346,7 @@ test("validator CLI reports the successful reviewer and harness counts", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout.trim(),
-    "Validated 6 reviewer roles across 4 harnesses.",
+    "Validated 1 skill, 6 reviewer roles, 24 generated agents, and 5 manifests.",
   );
   assert.equal(result.stderr, "");
 });
@@ -367,7 +367,7 @@ test("validator CLI runs correctly when invoked through a symlinked script path"
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       result.stdout.trim(),
-      "Validated 6 reviewer roles across 4 harnesses.",
+      "Validated 1 skill, 6 reviewer roles, 24 generated agents, and 5 manifests.",
     );
     assert.equal(result.stderr, "");
   } finally {

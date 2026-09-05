@@ -1,6 +1,7 @@
 import {
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -8,15 +9,17 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import YAML from "yaml";
 
 import { isMainModule } from "./is-main-module.mjs";
-import { assertValidConfig, isSafeRelativePath } from "./validate.mjs";
+import { parseYamlDocument } from "../skills/knights-of-the-round-table/scripts/parse-yaml.mjs";
+import {
+  assertValidConfig,
+  isSafeRelativePath,
+} from "../skills/knights-of-the-round-table/scripts/validate-config.mjs";
 
 const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CONFIG_RELATIVE_PATH =
-  "skills/knights-of-the-round-table/config/reviewers.yaml";
-const PROMPT_DIRECTORY = "skills/knights-of-the-round-table";
+const CONFIG_RELATIVE_PATH = "config/reviewers.yaml";
+const DEFAULT_SKILL_DIRECTORY = "skills/knights-of-the-round-table";
 const MANIFEST_FILENAME = ".generated-agents.json";
 const HARNESS_DIRECTORIES = {
   claude: "generated/claude/agents",
@@ -69,10 +72,6 @@ const renderers = {
     `model: inherit\n---\n\n${prompt}\n`,
 };
 
-function toPosixPath(path) {
-  return path.split(sep).join("/");
-}
-
 function lstatIfExists(path) {
   try {
     return lstatSync(path);
@@ -114,41 +113,44 @@ function nearestExistingPath(path) {
   return currentPath;
 }
 
-function loadConfig(projectRoot) {
-  return YAML.parse(
-    readFileSync(resolve(projectRoot, CONFIG_RELATIVE_PATH), "utf8"),
+// Check each component before reading, including optional config paths. Never
+// follow a skill/config/prompt symlink, even when its target is inside the repo.
+function reviewerInputPath(root, path, kind = "file", optional = false) {
+  if (!isSafeRelativePath(path)) {
+    throw new Error(`Unsafe reviewer input path: ${path}`);
+  }
+  let current = resolve(root);
+  for (const part of path.split("/")) {
+    current = resolve(current, part);
+    const stats = optional ? lstatIfExists(current) : lstatSync(current);
+    if (stats === null) return null;
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Reviewer input must not be a symlink: ${current}`);
+    }
+  }
+  const stats = lstatSync(current);
+  if (kind === "directory" ? !stats.isDirectory() : !stats.isFile()) {
+    throw new Error(`${path} must be a ${kind === "directory" ? "directory" : "regular file"}`);
+  }
+  return assertRealPathContained(realpathSync(root), current, `Reviewer input ${path}`);
+}
+
+function loadConfig(skillRoot) {
+  return parseYamlDocument(
+    readFileSync(reviewerInputPath(skillRoot, CONFIG_RELATIVE_PATH), "utf8"),
+    `reviewer configuration in ${skillRoot}`,
   );
 }
 
-function resolveContainedPromptPath(projectRoot, prompt) {
-  if (!isSafeRelativePath(prompt)) {
-    throw new Error(`Unsafe reviewer prompt path: ${prompt}`);
-  }
-
-  const promptRoot = resolve(projectRoot, PROMPT_DIRECTORY);
-  const promptPath = resolve(promptRoot, prompt);
-  const relativePromptPath = toPosixPath(relative(promptRoot, promptPath));
-  if (!isSafeRelativePath(relativePromptPath)) {
-    throw new Error(`Unsafe reviewer prompt path: ${prompt}`);
-  }
-
-  const realPromptRoot = realpathSync(promptRoot);
-  const realPromptPath = realpathSync(promptPath);
-  const realRelativePromptPath = toPosixPath(
-    relative(realPromptRoot, realPromptPath),
-  );
-  if (!isSafeRelativePath(realRelativePromptPath)) {
-    throw new Error(`Reviewer prompt escapes prompt directory: ${prompt}`);
-  }
-  return realPromptPath;
-}
-
-function loadPrompts(config, projectRoot) {
+function loadPrompts(config, skillRoot) {
   return Object.fromEntries(
-    config.reviewers.map(({ prompt }) => [
-      prompt,
-      readFileSync(resolveContainedPromptPath(projectRoot, prompt), "utf8"),
-    ]),
+    config.reviewers.map(({ role, prompt }) => {
+      try {
+        return [prompt, readFileSync(reviewerInputPath(skillRoot, prompt), "utf8")];
+      } catch (error) {
+        throw new Error(`reviewer ${role} prompt: ${error.message}`, { cause: error });
+      }
+    }),
   );
 }
 
@@ -186,11 +188,49 @@ export function renderAgents(config, prompts) {
   return rendered;
 }
 
+// Shared by the repository renderer and validator so discovery, parsing, prompt
+// resolution, and cross-skill filename ownership always use the same inputs.
+export function renderRepositoryAgents({ projectRoot = DEFAULT_PROJECT_ROOT } = {}) {
+  const skillsRoot = reviewerInputPath(projectRoot, "skills", "directory");
+  const entries = readdirSync(skillsRoot, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const rendered = Object.fromEntries(
+    Object.keys(HARNESS_DIRECTORIES).map((harness) => [harness, {}]),
+  );
+  const skills = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+    const skillRoot = reviewerInputPath(skillsRoot, entry.name, "directory");
+    if (reviewerInputPath(skillRoot, CONFIG_RELATIVE_PATH, "file", true) === null) continue;
+    const config = loadConfig(skillRoot);
+    assertValidConfig(config);
+    const skillAgents = renderAgents(config, loadPrompts(config, skillRoot));
+    for (const [harness, files] of Object.entries(skillAgents)) {
+      for (const [filename, content] of Object.entries(files)) {
+        if (Object.hasOwn(rendered[harness], filename)) {
+          throw new Error(`duplicate output filename for ${harness}: ${filename}`);
+        }
+        rendered[harness][filename] = content;
+      }
+    }
+    skills.push({ name: entry.name, skillRoot, config });
+  }
+  if (skills.length === 0 || expectedOwnedPaths(rendered).length === 0) {
+    throw new Error(`No reviewer agents discovered from skills/*/${CONFIG_RELATIVE_PATH}; refusing to synchronize generated outputs`);
+  }
+  return { rendered, skills };
+}
+
 export function renderAll(options = {}) {
   const projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
-  const config = options.config ?? loadConfig(projectRoot);
+  // Keep this public API single-config, defaulting to the canonical skill.
+  // Repository-wide callers must use renderRepositoryAgents explicitly.
+  const skillRoot = resolve(projectRoot, DEFAULT_SKILL_DIRECTORY);
+  const config = options.config ?? loadConfig(
+    reviewerInputPath(projectRoot, DEFAULT_SKILL_DIRECTORY, "directory"),
+  );
   assertValidConfig(config);
-  const prompts = options.prompts ?? loadPrompts(config, projectRoot);
+  const prompts = options.prompts ?? loadPrompts(config, skillRoot);
   return renderAgents(config, prompts);
 }
 
@@ -524,13 +564,31 @@ function synchronizeOwnedOutputs(projectRoot, rendered, manifest) {
   );
 }
 
+// Read-only verification also accepts rendered agents collected from multiple skills.
+export function checkGeneratedAgents(rendered, { projectRoot = DEFAULT_PROJECT_ROOT } = {}) {
+  assertOutputPathsSafe(projectRoot, rendered);
+  const manifest = loadOwnershipManifest(projectRoot);
+  return {
+    drift: findDrift(projectRoot, rendered, manifest),
+    fileCount: Object.values(rendered).reduce(
+      (count, files) => count + Object.keys(files).length,
+      0,
+    ),
+  };
+}
+
 export function synchronizeGeneratedAgents(options = {}) {
   const projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
-  const rendered = renderAll({
-    projectRoot,
-    config: options.config,
-    prompts: options.prompts,
-  });
+  const rendered = options.config == null && options.prompts == null
+    ? renderRepositoryAgents({ projectRoot }).rendered
+    : renderAll({
+      projectRoot,
+      config: options.config,
+      prompts: options.prompts,
+    });
+  if (options.check) {
+    return checkGeneratedAgents(rendered, { projectRoot });
+  }
   const { resolvedProjectRoot, realProjectRoot } = assertOutputPathsSafe(
     projectRoot,
     rendered,
@@ -542,15 +600,13 @@ export function synchronizeGeneratedAgents(options = {}) {
     0,
   );
 
-  if (!options.check) {
-    assertOwnedDeletionPathsSafe(
-      resolvedProjectRoot,
-      realProjectRoot,
-      rendered,
-      manifest,
-    );
-    synchronizeOwnedOutputs(projectRoot, rendered, manifest);
-  }
+  assertOwnedDeletionPathsSafe(
+    resolvedProjectRoot,
+    realProjectRoot,
+    rendered,
+    manifest,
+  );
+  synchronizeOwnedOutputs(projectRoot, rendered, manifest);
 
   return { drift, fileCount };
 }

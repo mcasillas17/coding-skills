@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -13,7 +14,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -72,6 +73,29 @@ function removeRendererProject(projectRoot) {
   rmSync(projectRoot, { recursive: true, force: true });
 }
 
+function createRendererCliProject() {
+  const projectRoot = mkdtempSync(join(tmpdir(), "reviewer-renderer-cli-"));
+  const fixturePaths = [
+    "scripts/render-agents.mjs",
+    "scripts/is-main-module.mjs",
+    "skills/knights-of-the-round-table/scripts/parse-yaml.mjs",
+    "skills/knights-of-the-round-table/scripts/validate-config.mjs",
+    "skills/knights-of-the-round-table/config",
+    "skills/knights-of-the-round-table/reviewers",
+  ];
+
+  for (const relativePath of fixturePaths) {
+    const destination = join(projectRoot, relativePath);
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(
+      new URL(`../${relativePath}`, import.meta.url),
+      destination,
+      { recursive: true },
+    );
+  }
+  return projectRoot;
+}
+
 function checkedInUrl(harness, relativePath) {
   return new URL(
     `../${harnessDirectories[harness]}/${relativePath}`,
@@ -98,12 +122,12 @@ function checkedInGeneratedSnapshot() {
   return snapshot;
 }
 
-function runRenderer(...args) {
+function runRenderer(projectRoot, ...args) {
   return spawnSync(
     process.execPath,
-    ["scripts/render-agents.mjs", ...args],
+    [join(projectRoot, "scripts/render-agents.mjs"), ...args],
     {
-      cwd: repositoryRoot,
+      cwd: projectRoot,
       encoding: "utf8",
     },
   );
@@ -598,26 +622,39 @@ test("check mode reports missing and stale owned outputs without modifying files
 });
 
 test("check mode succeeds when current and fails when a generated file drifts", () => {
-  const current = runRenderer("--check");
-  assert.equal(current.status, 0, current.stderr);
-  assert.equal(
-    current.stdout.trim(),
-    "Generated reviewer agents are current.",
-  );
-  assert.equal(current.stderr, "");
-
-  const rendered = renderAll();
-  const [relativePath, expected] = Object.entries(rendered.copilot)[0];
-  const generatedUrl = checkedInUrl("copilot", relativePath);
+  const projectRoot = createRendererCliProject();
+  const checkedInBefore = checkedInGeneratedSnapshot();
 
   try {
-    writeFileSync(generatedUrl, `${expected}\n`);
-    const drifted = runRenderer("--check");
+    renderer.synchronizeGeneratedAgents({ projectRoot });
+    const current = runRenderer(projectRoot, "--check");
+    assert.equal(current.status, 0, current.stderr);
+    assert.equal(
+      current.stdout.trim(),
+      "Generated reviewer agents are current.",
+    );
+    assert.equal(current.stderr, "");
+
+    const rendered = renderAll({ projectRoot });
+    const [relativePath, expected] = Object.entries(rendered.copilot)[0];
+    const generatedPath = join(
+      projectRoot,
+      harnessDirectories.copilot,
+      relativePath,
+    );
+    writeFileSync(generatedPath, `${expected}\n`);
+
+    const drifted = runRenderer(projectRoot, "--check");
     assert.equal(drifted.status, 1);
     assert.match(drifted.stderr, /Generated reviewer agents are out of date:/);
     assert.match(drifted.stderr, new RegExp(`agents/${relativePath}`));
     assert.equal(drifted.stdout, "");
+    assert.deepEqual(
+      checkedInGeneratedSnapshot(),
+      checkedInBefore,
+      "renderer drift checks must not mutate checked-in generated agents",
+    );
   } finally {
-    writeFileSync(generatedUrl, expected);
+    removeRendererProject(projectRoot);
   }
 });
