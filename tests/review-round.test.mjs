@@ -92,8 +92,25 @@ test("deduplicates actionable findings by stable ID", () => {
   assert.deepEqual(result.missingReviewers, []);
   assert.deepEqual(
     result.actionable.map(({ id }) => id),
-    ["finding:null-path"],
+    ["finding:null-path", "finding:unsafe-output"],
   );
+  assert.deepEqual(
+    result.actionable[0],
+    {
+      id: "finding:null-path",
+      severity: "high",
+      confidence: 8,
+      file: "scripts/render-agents.mjs",
+      line: 42,
+      title: "Null path is dereferenced without a guard",
+      evidence: "path.relative(undefined, target) throws when target is null",
+      recommendation:
+        "Guard against a null target before computing the relative path",
+      status: "open",
+      reportedBy: ["correctness", "tests"],
+    },
+  );
+  assert.deepEqual(result.actionable[1].reportedBy, ["security"]);
 });
 
 test("does not claim convergence when a reviewer is missing", () => {
@@ -114,7 +131,7 @@ test("stops with unresolved findings at the configured round limit", () => {
   assert.equal(result.actionable[0].id, "finding:layering-violation");
 });
 
-test("keeps a single finding when duplicate IDs carry byte-for-byte identical payloads", () => {
+test("keeps a single finding and records every reviewer for identical duplicate IDs", () => {
   const shared = finding({ id: "finding:duplicate" });
   const round = baseRound({
     results: [
@@ -127,21 +144,132 @@ test("keeps a single finding when duplicate IDs carry byte-for-byte identical pa
   const result = evaluateRound(round);
   assert.equal(result.state, "actionable");
   assert.equal(result.actionable.length, 1);
-  assert.deepEqual(result.actionable[0], shared);
+  assert.deepEqual(result.actionable[0], {
+    ...shared,
+    reportedBy: ["correctness", "tests"],
+  });
 });
 
-test("rejects conflicting payloads that share a finding ID", () => {
+test("chooses duplicate finding payloads by severity, confidence, then reviewer and preserves other findings", () => {
   const round = baseRound({
     results: [
-      completed("correctness", [finding({ id: "finding:conflict" })]),
       completed("tests", [
-        finding({ id: "finding:conflict", severity: "critical" }),
+        finding({
+          id: "finding:reviewer-tie",
+          severity: "high",
+          confidence: 8,
+          title: "Tests wording",
+        }),
+        finding({
+          id: "finding:severity",
+          severity: "high",
+          confidence: 10,
+          title: "High severity wording",
+        }),
+      ]),
+      completed("architecture", [
+        finding({
+          id: "finding:reviewer-tie",
+          severity: "high",
+          confidence: 8,
+          title: "Architecture wording",
+        }),
+        finding({
+          id: "finding:confidence",
+          severity: "medium",
+          confidence: 6,
+          title: "Lower confidence wording",
+        }),
+      ]),
+      completed("security", [
+        finding({
+          id: "finding:severity",
+          severity: "critical",
+          confidence: 1,
+          title: "Critical severity wording",
+        }),
+        finding({
+          id: "finding:confidence",
+          severity: "medium",
+          confidence: 9,
+          title: "Higher confidence wording",
+        }),
+        finding({
+          id: "finding:unique",
+          severity: "low",
+          confidence: 5,
+          title: "Unique finding",
+        }),
+      ]),
+      completed("correctness", [
+        finding({
+          id: "finding:severity",
+          severity: "medium",
+          confidence: 10,
+          title: "Medium severity wording",
+        }),
+      ]),
+      completed("documentation"),
+      completed("performance"),
+    ],
+  });
+
+  const result = evaluateRound(round);
+
+  assert.equal(result.state, "actionable");
+  assert.deepEqual(
+    result.actionable.map(({ id, title, reportedBy }) => ({
+      id,
+      title,
+      reportedBy,
+    })),
+    [
+      {
+        id: "finding:confidence",
+        title: "Higher confidence wording",
+        reportedBy: ["architecture", "security"],
+      },
+      {
+        id: "finding:reviewer-tie",
+        title: "Architecture wording",
+        reportedBy: ["architecture", "tests"],
+      },
+      {
+        id: "finding:severity",
+        title: "Critical severity wording",
+        reportedBy: ["correctness", "security", "tests"],
+      },
+      {
+        id: "finding:unique",
+        title: "Unique finding",
+        reportedBy: ["security"],
+      },
+    ],
+  );
+});
+
+test("rejects duplicate finding IDs within the same reviewer result", () => {
+  const round = baseRound({
+    results: [
+      completed("correctness", [
+        finding({ id: "finding:duplicate" }),
+        finding({
+          id: "finding:duplicate",
+          severity: "critical",
+          confidence: 10,
+        }),
+      ]),
+      completed("tests", [
+        finding({ id: "finding:other-reviewer" }),
       ]),
       ...REQUIRED_REVIEWERS.slice(2).map((reviewer) => completed(reviewer)),
     ],
   });
 
-  assert.throws(() => evaluateRound(round), /conflicting finding payload/);
+  assert.throws(
+    () => evaluateRound(round),
+    /duplicate finding id for reviewer correctness: finding:duplicate/,
+  );
 });
 
 test("orders actionable findings and missing reviewers deterministically", () => {
@@ -692,8 +820,10 @@ test("emits actionable findings with identical serialization regardless of dupli
     "evidence",
     "recommendation",
     "status",
+    "reportedBy",
   ];
-  const REVERSE_ORDER = [...FORWARD_ORDER].reverse();
+  const INPUT_FORWARD_ORDER = FORWARD_ORDER.slice(0, -1);
+  const INPUT_REVERSE_ORDER = [...INPUT_FORWARD_ORDER].reverse();
   const values = {
     id: "finding:dup",
     severity: "medium",
@@ -716,7 +846,9 @@ test("emits actionable findings with identical serialization regardless of dupli
 
   const resultsForward = REQUIRED_REVIEWERS.map((reviewer, index) =>
     completed(reviewer, [
-      findingWithOrder(index % 2 === 0 ? FORWARD_ORDER : REVERSE_ORDER),
+      findingWithOrder(
+        index % 2 === 0 ? INPUT_FORWARD_ORDER : INPUT_REVERSE_ORDER,
+      ),
     ]),
   );
   const resultsBackward = resultsForward
@@ -725,7 +857,9 @@ test("emits actionable findings with identical serialization regardless of dupli
     .map((result, index) => ({
       ...result,
       findings: [
-        findingWithOrder(index % 2 === 0 ? REVERSE_ORDER : FORWARD_ORDER),
+        findingWithOrder(
+          index % 2 === 0 ? INPUT_REVERSE_ORDER : INPUT_FORWARD_ORDER,
+        ),
       ],
     }));
 
@@ -734,5 +868,9 @@ test("emits actionable findings with identical serialization regardless of dupli
 
   assert.deepEqual(Object.keys(forward.actionable[0]), FORWARD_ORDER);
   assert.deepEqual(Object.keys(backward.actionable[0]), FORWARD_ORDER);
+  assert.deepEqual(
+    forward.actionable[0].reportedBy,
+    [...REQUIRED_REVIEWERS].sort(),
+  );
   assert.equal(JSON.stringify(forward), JSON.stringify(backward));
 });

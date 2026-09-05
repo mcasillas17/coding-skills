@@ -3,11 +3,13 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import YAML from "yaml";
 
@@ -325,6 +327,30 @@ test("validator CLI reports the successful reviewer and harness counts", () => {
     "Validated 6 reviewer roles across 4 harnesses.",
   );
   assert.equal(result.stderr, "");
+});
+
+test("validator CLI runs correctly when invoked through a symlinked script path", () => {
+  const directory = mkdtempSync(join(tmpdir(), "validator-symlink-"));
+  const realScriptPath = fileURLToPath(
+    new URL("../scripts/validate.mjs", import.meta.url),
+  );
+  const linkPath = join(directory, "validate-link.mjs");
+  symlinkSync(realScriptPath, linkPath);
+
+  try {
+    const result = spawnSync(process.execPath, [linkPath], {
+      cwd: new URL("..", import.meta.url),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      result.stdout.trim(),
+      "Validated 6 reviewer roles across 4 harnesses.",
+    );
+    assert.equal(result.stderr, "");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("validator CLI exits 1 and reports validation failures to stderr", () => {

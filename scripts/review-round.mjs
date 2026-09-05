@@ -1,5 +1,6 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+
+import { isMainModule } from "./is-main-module.mjs";
 
 const TOP_LEVEL_KEYS = ["round", "maxRounds", "requiredReviewers", "results"];
 const RESULT_KEYS = new Set(["reviewer", "status", "findings"]);
@@ -16,7 +17,13 @@ const FINDING_FIELD_ORDER = [
   "status",
 ];
 const FINDING_KEYS = new Set(FINDING_FIELD_ORDER);
-const SEVERITIES = new Set(["critical", "high", "medium", "low"]);
+const SEVERITY_PRIORITY = new Map([
+  ["critical", 4],
+  ["high", 3],
+  ["medium", 2],
+  ["low", 1],
+]);
+const SEVERITIES = new Set(SEVERITY_PRIORITY.keys());
 const FINDING_STATUSES = new Set(["open"]);
 
 function isMapping(value) {
@@ -39,28 +46,32 @@ function canonicalizeFinding(finding) {
   return canonical;
 }
 
-function deepEqual(a, b) {
-  if (a === b) {
-    return true;
+function compareLexically(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareFindingReports(a, b) {
+  const severityDifference =
+    SEVERITY_PRIORITY.get(b.finding.severity) -
+    SEVERITY_PRIORITY.get(a.finding.severity);
+  if (severityDifference !== 0) {
+    return severityDifference;
   }
-  if (Array.isArray(a) || Array.isArray(b)) {
-    return (
-      Array.isArray(a) &&
-      Array.isArray(b) &&
-      a.length === b.length &&
-      a.every((item, index) => deepEqual(item, b[index]))
-    );
+
+  const confidenceDifference =
+    b.finding.confidence - a.finding.confidence;
+  if (confidenceDifference !== 0) {
+    return confidenceDifference;
   }
-  if (isMapping(a) && isMapping(b)) {
-    const aKeys = Object.keys(a).sort();
-    const bKeys = Object.keys(b).sort();
-    return (
-      aKeys.length === bKeys.length &&
-      aKeys.every((key, index) => key === bKeys[index]) &&
-      aKeys.every((key) => deepEqual(a[key], b[key]))
-    );
-  }
-  return false;
+
+  return compareLexically(a.reviewer, b.reviewer);
+}
+
+function createActionableFinding(report, reportedBy) {
+  return {
+    ...report.finding,
+    reportedBy: [...reportedBy].sort(compareLexically),
+  };
 }
 
 function validateFinding(finding, label, errors) {
@@ -188,32 +199,34 @@ function collectErrors(round) {
         );
       }
 
-      if (status === "completed") {
-        if (!Array.isArray(result.findings)) {
-          errors.push(
-            `${label}.findings must be an array for a completed result`,
+      if (status === "completed" && !Array.isArray(result.findings)) {
+        errors.push(
+          `${label}.findings must be an array for a completed result`,
+        );
+      } else if (
+        Object.hasOwn(result, "findings") &&
+        !Array.isArray(result.findings)
+      ) {
+        errors.push(`${label}.findings must be an array when present`);
+      }
+
+      if (Array.isArray(result.findings)) {
+        const seenFindingIds = new Set();
+        result.findings.forEach((finding, findingIndex) => {
+          validateFinding(
+            finding,
+            `${label}.findings[${findingIndex}]`,
+            errors,
           );
-        } else {
-          result.findings.forEach((finding, findingIndex) => {
-            validateFinding(
-              finding,
-              `${label}.findings[${findingIndex}]`,
-              errors,
-            );
-          });
-        }
-      } else if (Object.hasOwn(result, "findings")) {
-        if (!Array.isArray(result.findings)) {
-          errors.push(`${label}.findings must be an array when present`);
-        } else {
-          result.findings.forEach((finding, findingIndex) => {
-            validateFinding(
-              finding,
-              `${label}.findings[${findingIndex}]`,
-              errors,
-            );
-          });
-        }
+          if (isMapping(finding) && isNonEmptyString(finding.id)) {
+            if (seenFindingIds.has(finding.id)) {
+              errors.push(
+                `duplicate finding id for reviewer ${reviewer}: ${finding.id}`,
+              );
+            }
+            seenFindingIds.add(finding.id);
+          }
+        });
       }
     });
   }
@@ -238,22 +251,33 @@ export function evaluateRound(round) {
     .slice()
     .sort();
 
-  const findingsById = new Map();
+  const findingGroupsById = new Map();
   for (const result of completedResults) {
     for (const rawFinding of result.findings) {
-      const finding = canonicalizeFinding(rawFinding);
-      const existing = findingsById.get(finding.id);
+      const report = {
+        reviewer: result.reviewer,
+        finding: canonicalizeFinding(rawFinding),
+      };
+      const existing = findingGroupsById.get(report.finding.id);
       if (existing === undefined) {
-        findingsById.set(finding.id, finding);
-      } else if (!deepEqual(existing, finding)) {
-        throw new Error(`conflicting finding payload for id: ${finding.id}`);
+        findingGroupsById.set(report.finding.id, {
+          canonicalReport: report,
+          reportedBy: new Set([result.reviewer]),
+        });
+      } else {
+        existing.reportedBy.add(result.reviewer);
+        if (compareFindingReports(report, existing.canonicalReport) < 0) {
+          existing.canonicalReport = report;
+        }
       }
     }
   }
 
-  const actionable = [...findingsById.values()].sort((a, b) =>
-    a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
-  );
+  const actionable = [...findingGroupsById.values()]
+    .map(({ canonicalReport, reportedBy }) =>
+      createActionableFinding(canonicalReport, reportedBy),
+    )
+    .sort((a, b) => compareLexically(a.id, b.id));
 
   if (missingReviewers.length > 0) {
     return { state: "incomplete", actionable, missingReviewers };
@@ -317,27 +341,6 @@ function runCli() {
   process.exitCode = exitCodeFor(result.state);
 }
 
-function realpathOrNull(path) {
-  try {
-    return realpathSync(path);
-  } catch {
-    return null;
-  }
-}
-
-function isMainModule() {
-  if (process.argv[1] === undefined) {
-    return false;
-  }
-  const invokedRealPath = realpathOrNull(process.argv[1]);
-  const moduleRealPath = realpathOrNull(fileURLToPath(import.meta.url));
-  return (
-    invokedRealPath !== null &&
-    moduleRealPath !== null &&
-    invokedRealPath === moduleRealPath
-  );
-}
-
-if (isMainModule()) {
+if (isMainModule(import.meta.url)) {
   runCli();
 }

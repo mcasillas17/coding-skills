@@ -14,6 +14,7 @@ import {
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import * as renderer from "../scripts/render-agents.mjs";
@@ -240,6 +241,27 @@ test("checked-in generated agents match renderer output", () => {
 
 test("renderer output is deterministic", () => {
   assert.deepEqual(renderAll(), renderAll());
+});
+
+test("renderer check CLI runs correctly when invoked through a symlinked script path", () => {
+  const directory = mkdtempSync(join(tmpdir(), "renderer-symlink-"));
+  const realScriptPath = fileURLToPath(
+    new URL("../scripts/render-agents.mjs", import.meta.url),
+  );
+  const linkPath = join(directory, "render-agents-link.mjs");
+  symlinkSync(realScriptPath, linkPath);
+
+  try {
+    const result = spawnSync(process.execPath, [linkPath, "--check"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "Generated reviewer agents are current.");
+    assert.equal(result.stderr, "");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("renderer rejects duplicate output filenames instead of overwriting", () => {

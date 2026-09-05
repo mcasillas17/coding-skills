@@ -33,18 +33,34 @@
       "findings": [
         {
           "id": "finding:null-path",
-          "severity": "high",
-          "confidence": 8,
+          "severity": "medium",
+          "confidence": 10,
           "file": "scripts/render-agents.mjs",
-          "line": 42,
-          "title": "Null path is dereferenced without a guard",
-          "evidence": "path.relative(undefined, target) throws when target is null",
-          "recommendation": "Guard against a null target before computing the relative path",
+          "line": 44,
+          "title": "Missing target validation can crash rendering",
+          "evidence": "The tests exercise an undefined target that reaches path.relative",
+          "recommendation": "Validate the target before path operations",
           "status": "open"
         }
       ]
     },
-    { "reviewer": "security", "status": "completed", "findings": [] },
+    {
+      "reviewer": "security",
+      "status": "completed",
+      "findings": [
+        {
+          "id": "finding:unsafe-output",
+          "severity": "low",
+          "confidence": 7,
+          "file": "scripts/render-agents.mjs",
+          "line": 75,
+          "title": "Output path is not checked before writing",
+          "evidence": "The generated path is passed directly to writeFileSync",
+          "recommendation": "Confirm the output remains inside the repository",
+          "status": "open"
+        }
+      ]
+    },
     { "reviewer": "documentation", "status": "completed", "findings": [] },
     { "reviewer": "architecture", "status": "completed", "findings": [] },
     { "reviewer": "performance", "status": "completed", "findings": [] }

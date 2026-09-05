@@ -10,6 +10,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
+import { isMainModule } from "./is-main-module.mjs";
 import { assertValidConfig, isSafeRelativePath } from "./validate.mjs";
 
 const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -590,9 +591,6 @@ function runCli() {
   console.log(`Rendered ${result.fileCount} reviewer agents.`);
 }
 
-const isMain =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+if (isMainModule(import.meta.url)) {
   runCli();
 }

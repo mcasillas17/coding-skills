@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
-import { posix, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { posix } from "node:path";
 import YAML from "yaml";
+
+import { isMainModule } from "./is-main-module.mjs";
 
 const ALLOWED_TOP_LEVEL = new Set([
   "version",
@@ -227,9 +228,6 @@ function runCli() {
   );
 }
 
-const isMain =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+if (isMainModule(import.meta.url)) {
   runCli();
 }
