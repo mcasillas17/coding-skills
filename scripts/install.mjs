@@ -318,6 +318,17 @@ function assertSafeSkillName(skill) {
   }
 }
 
+// Boundary check for `home` before it ever reaches `resolve`. `resolve("")`
+// (or an all-whitespace string) silently resolves to `process.cwd()`,
+// retargeting the entire install away from the caller's intended directory
+// instead of failing. Reject that here, fail closed, and never echo the
+// (potentially empty/whitespace) value itself in the error.
+function assertSafeHome(home) {
+  if (typeof home !== "string" || home.trim().length === 0) {
+    throw new Error("Home directory must be a non-empty path");
+  }
+}
+
 function normalizeHarnesses(rawHarnesses) {
   if (!Array.isArray(rawHarnesses) || rawHarnesses.length === 0) {
     throw new Error("At least one harness must be selected");
@@ -789,6 +800,9 @@ export function install(options = {}) {
 
   const harnesses = normalizeHarnesses(options.harnesses ?? ["all"]);
   const force = options.force === true;
+  if (options.home !== undefined) {
+    assertSafeHome(options.home);
+  }
   const resolvedHome = resolve(options.home ?? homedir());
   const projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
 

@@ -1043,3 +1043,63 @@ test("CLI accepts --harness all and --force", (t) => {
     );
   }
 });
+
+test("install() rejects an empty home instead of retargeting to the current directory", (t) => {
+  const projectRoot = withFixture(t);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home: "",
+        harnesses: ["claude"],
+      }),
+    /home/i,
+  );
+
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+});
+
+test("install() rejects a whitespace-only home instead of retargeting to the current directory", (t) => {
+  const projectRoot = withFixture(t);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home: "   ",
+        harnesses: ["claude"],
+      }),
+    /home/i,
+  );
+
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+});
+
+test("CLI fails clearly on an empty --home value without mutating the current directory", (t) => {
+  t.after(() => rmSync(join(repositoryRoot, ".claude"), { recursive: true, force: true }));
+
+  const outcome = spawnSync(
+    process.execPath,
+    ["scripts/install.mjs", "--harness", "claude", "--home", ""],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+
+  assert.notEqual(outcome.status, 0);
+  assert.match(outcome.stderr, /home/i);
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+});
+
+test("CLI fails clearly on a whitespace-only --home value without mutating the current directory", (t) => {
+  t.after(() => rmSync(join(repositoryRoot, ".claude"), { recursive: true, force: true }));
+
+  const outcome = spawnSync(
+    process.execPath,
+    ["scripts/install.mjs", "--harness", "claude", "--home", "   "],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+
+  assert.notEqual(outcome.status, 0);
+  assert.match(outcome.stderr, /home/i);
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+});
