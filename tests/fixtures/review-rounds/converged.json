@@ -1,0 +1,20 @@
+{
+  "round": 1,
+  "maxRounds": 10,
+  "requiredReviewers": [
+    "correctness",
+    "tests",
+    "security",
+    "documentation",
+    "architecture",
+    "performance"
+  ],
+  "results": [
+    { "reviewer": "correctness", "status": "completed", "findings": [] },
+    { "reviewer": "tests", "status": "completed", "findings": [] },
+    { "reviewer": "security", "status": "completed", "findings": [] },
+    { "reviewer": "documentation", "status": "completed", "findings": [] },
+    { "reviewer": "architecture", "status": "completed", "findings": [] },
+    { "reviewer": "performance", "status": "completed", "findings": [] }
+  ]
+}

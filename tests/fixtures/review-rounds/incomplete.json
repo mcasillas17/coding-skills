@@ -1,0 +1,35 @@
+{
+  "round": 1,
+  "maxRounds": 10,
+  "requiredReviewers": [
+    "correctness",
+    "tests",
+    "security",
+    "documentation",
+    "architecture",
+    "performance"
+  ],
+  "results": [
+    {
+      "reviewer": "correctness",
+      "status": "completed",
+      "findings": [
+        {
+          "id": "finding:missing-timeout",
+          "severity": "medium",
+          "confidence": 6,
+          "file": "scripts/install.mjs",
+          "line": 17,
+          "title": "Network request has no timeout",
+          "evidence": "fetch(url) is called without an AbortController",
+          "recommendation": "Add a timeout guard around the installer fetch call",
+          "status": "open"
+        }
+      ]
+    },
+    { "reviewer": "tests", "status": "completed", "findings": [] },
+    { "reviewer": "security", "status": "completed", "findings": [] },
+    { "reviewer": "documentation", "status": "completed", "findings": [] },
+    { "reviewer": "architecture", "status": "completed", "findings": [] }
+  ]
+}

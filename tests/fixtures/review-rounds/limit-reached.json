@@ -1,0 +1,36 @@
+{
+  "round": 10,
+  "maxRounds": 10,
+  "requiredReviewers": [
+    "correctness",
+    "tests",
+    "security",
+    "documentation",
+    "architecture",
+    "performance"
+  ],
+  "results": [
+    { "reviewer": "correctness", "status": "completed", "findings": [] },
+    { "reviewer": "tests", "status": "completed", "findings": [] },
+    { "reviewer": "security", "status": "completed", "findings": [] },
+    { "reviewer": "documentation", "status": "completed", "findings": [] },
+    {
+      "reviewer": "architecture",
+      "status": "completed",
+      "findings": [
+        {
+          "id": "finding:layering-violation",
+          "severity": "critical",
+          "confidence": 9,
+          "file": "scripts/render-agents.mjs",
+          "line": 88,
+          "title": "Renderer imports a script-only module from a shared module",
+          "evidence": "render-agents.mjs imports scripts/validate.mjs's CLI entry point directly",
+          "recommendation": "Extract the shared logic into a module both scripts can import",
+          "status": "open"
+        }
+      ]
+    },
+    { "reviewer": "performance", "status": "completed", "findings": [] }
+  ]
+}
