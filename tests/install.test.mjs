@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -27,6 +27,13 @@ const GENERATED_AGENT_SOURCE_DIRS = {
   copilot: "agents",
   codex: "generated/codex/agents",
   gemini: "generated/gemini/agents",
+};
+
+const AGENT_HARNESS_DIRS = {
+  claude: ".claude/agents",
+  copilot: ".copilot/agents",
+  codex: ".codex/agents",
+  gemini: ".gemini/agents",
 };
 
 const SKILL_INSTALL_PATHS = {
@@ -74,6 +81,20 @@ function skillYaml() {
   ].join("\n");
 }
 
+// Same shape as skillYaml(), but with a single reviewer/harness agent name
+// replaced so tests can exercise a malicious or renamed agent name without
+// hand-maintaining a second full config fixture.
+function skillYamlWithHarnessName(role, harness, name) {
+  const marker = `      ${harness}: ${role}-reviewer`;
+  const lines = skillYaml().split("\n");
+  const index = lines.indexOf(marker);
+  if (index === -1) {
+    throw new Error(`fixture marker not found: ${marker}`);
+  }
+  lines[index] = `      ${harness}: ${name}`;
+  return lines.join("\n");
+}
+
 function skillMarkdown({
   version = "0.1.0",
   name = "knights-of-the-round-table",
@@ -91,7 +112,10 @@ function skillMarkdown({
 // a real skill tree plus checked-in generated reviewer agents produced by the
 // project's own renderer, so install.mjs can validate against real output
 // without depending on (or mutating) the actual repository tree.
-function createFixtureProjectRoot({ skillVersion = "0.1.0" } = {}) {
+function createFixtureProjectRoot({
+  skillVersion = "0.1.0",
+  reviewersYaml = skillYaml(),
+} = {}) {
   const projectRoot = tempDir("knights-install-fixture-");
   const skillDir = join(
     projectRoot,
@@ -103,7 +127,7 @@ function createFixtureProjectRoot({ skillVersion = "0.1.0" } = {}) {
     join(skillDir, "SKILL.md"),
     skillMarkdown({ version: skillVersion }),
   );
-  writeFileSync(join(skillDir, "config/reviewers.yaml"), skillYaml());
+  writeFileSync(join(skillDir, "config/reviewers.yaml"), reviewersYaml);
   writeFileSync(
     join(skillDir, "reviewers/correctness.md"),
     "Review requirements and edge cases only.\n",
@@ -121,11 +145,29 @@ function createFixtureProjectRoot({ skillVersion = "0.1.0" } = {}) {
     );
     mkdirSync(directory, { recursive: true });
     for (const [filename, content] of Object.entries(files)) {
-      writeFileSync(join(directory, filename), content);
+      // The rendered filename is not validated here on purpose: fixtures
+      // that intentionally use a path-traversal or multi-segment agent name
+      // (see createTraversalFixtureProjectRoot) need this loop to plant the
+      // matching bytes wherever that filename actually resolves, exactly as
+      // a pre-hardening installer would read them.
+      const filePath = join(directory, filename);
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, content);
     }
   }
 
   return projectRoot;
+}
+
+// Builds a project root whose reviewer config maps one harness's agent name
+// to an unsafe value (path traversal, or a multi-segment path). The matching
+// "generated" bytes are planted at whatever location that name resolves to,
+// so the fixture proves the installer rejects the filename itself rather
+// than merely failing to find a file that was never written.
+function createTraversalFixtureProjectRoot({ role, harness, name }) {
+  return createFixtureProjectRoot({
+    reviewersYaml: skillYamlWithHarnessName(role, harness, name),
+  });
 }
 
 function createGenericSkillFixture(projectRoot, name) {
@@ -522,6 +564,99 @@ test("refuses an unmanaged agent file collision even with force", (t) => {
   );
 });
 
+// Rewrites the checked-in generated/<harness>/agents directory to match the
+// project's current reviewer config, removing any file that is no longer
+// part of the rendered set. Mirrors what a real repository update (a role
+// rename, a config edit) looks like from install.mjs's point of view.
+function resyncGeneratedAgentSourceDir(projectRoot, harness) {
+  const directory = join(projectRoot, GENERATED_AGENT_SOURCE_DIRS[harness]);
+  for (const existingFilename of readdirSync(directory)) {
+    rmSync(join(directory, existingFilename), { force: true });
+  }
+  const rendered = renderAll({ projectRoot });
+  for (const [filename, content] of Object.entries(rendered[harness])) {
+    writeFileSync(join(directory, filename), content);
+  }
+}
+
+test("force update removes a stale owned agent file, preserves unrelated files, and allows re-adding the freed name", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(
+    join(agentsDir, "unrelated-agent.md"),
+    "not managed by knights\n",
+  );
+
+  // Rename the security reviewer's claude agent: the old name drops out of
+  // the rendered set entirely.
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName("security", "claude", "security-reviewer-v2"),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  assert.equal(
+    existsSync(join(agentsDir, "security-reviewer.md")),
+    false,
+    "stale owned agent file must be removed",
+  );
+  assert.equal(
+    existsSync(join(agentsDir, "security-reviewer-v2.md")),
+    true,
+    "renamed agent file must be installed",
+  );
+  assert.equal(
+    existsSync(join(agentsDir, "correctness-reviewer.md")),
+    true,
+    "unrelated owned agent file must remain",
+  );
+  assert.equal(
+    readFileSync(join(agentsDir, "unrelated-agent.md"), "utf8"),
+    "not managed by knights\n",
+    "unrelated unmanaged file must remain untouched",
+  );
+
+  const manifest = readManifest(agentsDir);
+  assert.deepEqual(
+    manifest.files.map((file) => file.path).sort(),
+    ["correctness-reviewer.md", "security-reviewer-v2.md"],
+    "manifest must not still list the stale removed file",
+  );
+
+  // Renaming back to the original name must succeed: the stale file was
+  // actually deleted rather than merely dropped from the manifest, so it
+  // is not an unmanaged collision blocking re-installation.
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYaml(),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  assert.equal(existsSync(join(agentsDir, "security-reviewer.md")), true);
+  assert.equal(
+    existsSync(join(agentsDir, "security-reviewer-v2.md")),
+    false,
+  );
+  assert.equal(
+    readFileSync(join(agentsDir, "unrelated-agent.md"), "utf8"),
+    "not managed by knights\n",
+  );
+});
+
 test("invalid source (missing version metadata) leaves home unmodified", (t) => {
   const projectRoot = withFixture(t);
   const home = withHome(t);
@@ -574,6 +709,58 @@ test("invalid source (symlinked skill file) leaves home unmodified", (t) => {
 
   assert.deepEqual(listEntries(home), []);
   rmSync(externalFile, { recursive: true, force: true });
+});
+
+test("rejects a reviewer agent name that escapes its harness directory before any destination mutation", (t) => {
+  // Reviewer config only requires harness agent names to be non-empty
+  // strings, so a malicious or corrupted config could set one to a
+  // traversal sequence. install.mjs must reject every rendered agent
+  // filename unless it is a safe single path component with the harness's
+  // expected extension, resolving with dirname exactly equal to the
+  // intended directory -- mirroring render-agents.mjs's own invariant --
+  // and it must do so during source validation, before any destination
+  // (home) mutation.
+  const cases = [
+    // Exact traversal example from the report: escapes all the way past
+    // the home directory fixture itself, onto the shared filesystem.
+    { harness: "claude", name: "../../../pwned", filename: "../../../pwned.md" },
+    // Exact traversal example from the report: escapes the harness's own
+    // agent directory but stays inside home.
+    { harness: "codex", name: "../config", filename: "../config.toml" },
+    // Not a traversal, but still not a single path component.
+    { harness: "gemini", name: "nested/escape", filename: "nested/escape.md" },
+  ];
+
+  for (const { harness, name, filename } of cases) {
+    const projectRoot = createTraversalFixtureProjectRoot({
+      role: "correctness",
+      harness,
+      name,
+    });
+    t.after(() => rmSync(projectRoot, { recursive: true, force: true }));
+    const home = withHome(t);
+    const escapeTarget = resolve(join(home, AGENT_HARNESS_DIRS[harness]), filename);
+    t.after(() => rmSync(escapeTarget, { recursive: true, force: true }));
+
+    assert.equal(existsSync(escapeTarget), false, `${harness} ${name}: precondition`);
+
+    assert.throws(
+      () => install({ projectRoot, home, harnesses: [harness] }),
+      /unsafe/i,
+      `${harness} ${name}: should refuse to install`,
+    );
+
+    assert.equal(
+      existsSync(escapeTarget),
+      false,
+      `${harness} ${name}: no external file was written`,
+    );
+    assert.deepEqual(
+      listEntries(home),
+      [],
+      `${harness} ${name}: home directory left untouched`,
+    );
+  }
 });
 
 test("symlink escape causes no external write and no selected-destination mutation", (t) => {

@@ -56,6 +56,20 @@ const GENERATED_AGENT_SOURCE_DIRS = {
   gemini: "generated/gemini/agents",
 };
 
+// Expected filename extension per harness, mirroring render-agents.mjs's
+// HARNESS_EXTENSIONS. Reviewer config only requires each harness agent name
+// to be a non-empty string (see validate-config.mjs), so a malicious or
+// corrupted config could set one to a path-traversal sequence such as
+// `../../../pwned`. Every filename derived from that config must be
+// re-checked here before it is ever joined into a source or destination
+// directory.
+const AGENT_HARNESS_EXTENSIONS = {
+  claude: ".md",
+  copilot: ".agent.md",
+  codex: ".toml",
+  gemini: ".md",
+};
+
 function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
 }
@@ -83,6 +97,34 @@ function isContainedPath(root, path) {
 
 function toPosixPath(path) {
   return path.split(sep).join("/");
+}
+
+// Central safety gate for every reviewer agent filename, whether it comes
+// from the source (checked-in generated agents) or the destination
+// (installed home agent directories) side. Mirrors render-agents.mjs's own
+// `generatedPath` invariant: the filename must be a single safe path
+// component (no separators, no `..`), must carry the harness's expected
+// extension, and the resulting path's dirname must be exactly the intended
+// directory. Every call site that turns a config-derived name into a
+// filesystem path must go through this function before the path is read,
+// written, or deleted.
+function resolveSafeAgentFilePath(directory, harness, filename, description) {
+  if (
+    !isSafeRelativePath(filename) ||
+    filename.includes("/") ||
+    !filename.endsWith(AGENT_HARNESS_EXTENSIONS[harness])
+  ) {
+    throw new Error(
+      `Refusing to install: unsafe ${description} filename for ${harness}: ${filename}`,
+    );
+  }
+  const filePath = resolve(directory, filename);
+  if (dirname(filePath) !== directory) {
+    throw new Error(
+      `Refusing to install: unsafe ${description} filename for ${harness}: ${filename}`,
+    );
+  }
+  return filePath;
 }
 
 function serializeManifest(manifest) {
@@ -449,7 +491,12 @@ function validateGeneratedAgents({ projectRoot, harnesses }) {
     for (const [filename, expectedContent] of Object.entries(
       rendered[harness],
     )) {
-      const filePath = join(directory, filename);
+      const filePath = resolveSafeAgentFilePath(
+        directory,
+        harness,
+        filename,
+        "generated reviewer agent source",
+      );
       const stat = lstatIfExists(filePath);
       if (stat === null) {
         throw new Error(
@@ -541,8 +588,14 @@ function preflightSkillGroup({ targetDir, force }) {
 // Per-file ownership check for a shared agent directory (item 8, 9, 10):
 // unrelated files are always preserved, unowned collisions always refuse
 // (even with force), and owned collisions require --force and a matching
-// hash.
-function preflightAgentGroup({ targetDir, requiredFilenames, force }) {
+// hash. Also identifies (and verifies) stale owned files -- files this
+// installer previously wrote for this harness that are no longer part of
+// the current rendered set -- so a forced update can remove them instead of
+// leaving them behind as a permanent, unmanaged collision (item: stale
+// owned agent cleanup). A stale file is only ever scheduled for deletion
+// once it has been confirmed to still match the hash recorded for it in the
+// prior manifest; any drift causes a hard refusal instead.
+function preflightAgentGroup({ targetDir, harness, requiredFilenames, force }) {
   const stat = lstatIfExists(targetDir);
   if (stat !== null) {
     if (stat.isSymbolicLink()) {
@@ -565,9 +618,16 @@ function preflightAgentGroup({ targetDir, requiredFilenames, force }) {
     }
   }
 
+  const requiredSet = new Set(requiredFilenames);
   let hasOwnedCollision = false;
+
   for (const filename of requiredFilenames) {
-    const filePath = join(targetDir, filename);
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      filename,
+      "agent destination",
+    );
     const fileStat = lstatIfExists(filePath);
     if (fileStat === null) {
       continue;
@@ -591,11 +651,44 @@ function preflightAgentGroup({ targetDir, requiredFilenames, force }) {
     hasOwnedCollision = true;
   }
 
+  const staleFilenames = [];
+  for (const [filename, expectedHash] of ownedHashes) {
+    if (requiredSet.has(filename)) {
+      continue;
+    }
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      filename,
+      "agent destination",
+    );
+    const fileStat = lstatIfExists(filePath);
+    if (fileStat === null) {
+      // Already gone (e.g. removed by hand); nothing to clean up.
+      continue;
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      throw new Error(
+        `Refusing to install: existing agent file must be a regular file: ${filePath}`,
+      );
+    }
+    const actualHash = sha256(readFileSync(filePath));
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        `Refusing to install: file has drifted from the installer manifest, refusing to modify it: ${filePath}`,
+      );
+    }
+    staleFilenames.push(filename);
+    hasOwnedCollision = true;
+  }
+
   if (hasOwnedCollision && !force) {
     throw new Error(
       `Refusing to install: agent files already installed at ${targetDir} (pass --force to update)`,
     );
   }
+
+  return { staleFilenames };
 }
 
 function installSkillGroup({
@@ -643,14 +736,35 @@ function installAgentGroup({
   targetDir,
   harness,
   files,
+  staleFilenames = [],
   skill,
   skillVersion,
   resolvedProjectRoot,
 }) {
   mkdirSync(targetDir, { recursive: true });
+
+  // Remove stale owned files (preflightAgentGroup has already verified each
+  // one still matches the hash recorded in the prior manifest) before
+  // writing the current set, so a renamed or removed reviewer agent never
+  // lingers as an unmanaged collision blocking a future install.
+  for (const filename of staleFilenames) {
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      filename,
+      "agent destination",
+    );
+    rmSync(filePath, { force: true });
+  }
+
   const installedPaths = [];
   for (const file of files) {
-    const filePath = join(targetDir, file.filename);
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      file.filename,
+      "agent destination",
+    );
     writeFileSync(filePath, file.content);
     installedPaths.push(filePath);
   }
@@ -722,18 +836,20 @@ export function install(options = {}) {
     };
   });
 
-  for (const agentGroup of agentGroups) {
+  const agentPreflight = agentGroups.map((agentGroup) => {
     assertSafeAncestors(
       resolvedHome,
       agentGroup.targetDir,
       "Agent destination",
     );
-    preflightAgentGroup({
+    const { staleFilenames } = preflightAgentGroup({
       targetDir: agentGroup.targetDir,
+      harness: agentGroup.harness,
       requiredFilenames: agentGroup.files.map((file) => file.filename),
       force,
     });
-  }
+    return { agentGroup, staleFilenames };
+  });
 
   // Phase 4: every check above passed, so it is now safe to mutate.
   const installedPaths = [];
@@ -754,12 +870,13 @@ export function install(options = {}) {
     );
   }
 
-  for (const agentGroup of agentGroups) {
+  for (const { agentGroup, staleFilenames } of agentPreflight) {
     installedPaths.push(
       ...installAgentGroup({
         targetDir: agentGroup.targetDir,
         harness: agentGroup.harness,
         files: agentGroup.files,
+        staleFilenames,
         skill,
         skillVersion: source.skillVersion,
         resolvedProjectRoot: source.resolvedProjectRoot,
