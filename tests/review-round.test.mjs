@@ -323,6 +323,13 @@ test("rejects a non-positive-integer round or maxRounds", () => {
   );
 });
 
+test("rejects maxRounds above the hard maximum of 10", () => {
+  assert.throws(
+    () => evaluateRound(baseRound({ maxRounds: 11 })),
+    /maxRounds must be at most 10/,
+  );
+});
+
 test("rejects a round number that exceeds maxRounds", () => {
   assert.throws(
     () => evaluateRound(baseRound({ round: 11, maxRounds: 10 })),

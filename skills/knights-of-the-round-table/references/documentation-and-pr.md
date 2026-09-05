@@ -22,6 +22,9 @@ include alt text or captions.
 
 ## Final pull request gates
 
+Never publish or open any pull request, including a draft pull request, before
+convergence.
+
 Do not open a pull request of any kind — including a draft pull request — until
 all of the following hold:
 

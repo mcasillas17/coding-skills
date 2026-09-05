@@ -297,7 +297,7 @@ test("configuration rejects unknown and malformed values", () => {
     "unknown top-level key: extra",
     "version must be 1",
     "maxReviewRounds must be a positive integer",
-    "reviewerRetryCount must be a non-negative integer",
+    "reviewerRetryCount must be exactly 1",
     "documentationPolicy must be impact-based",
     "unsupported task source: remote-url",
     "unknown reviewer key: extra",
@@ -311,6 +311,28 @@ test("configuration rejects unknown and malformed values", () => {
     assert.ok(
       errors.some((error) => error.includes(expected)),
       `expected error containing "${expected}", received:\n${errors.join("\n")}`,
+    );
+  }
+});
+
+test("configuration enforces the hard round cap and single retry", () => {
+  const excessiveRounds = validateConfig(
+    validConfig({ maxReviewRounds: 11 }),
+  );
+  assert.ok(
+    excessiveRounds.some((error) =>
+      error.includes("maxReviewRounds must be at most 10"),
+    ),
+    excessiveRounds.join("\n"),
+  );
+
+  for (const reviewerRetryCount of [0, 2]) {
+    const errors = validateConfig(validConfig({ reviewerRetryCount }));
+    assert.ok(
+      errors.some((error) =>
+        error.includes("reviewerRetryCount must be exactly 1"),
+      ),
+      errors.join("\n"),
     );
   }
 });

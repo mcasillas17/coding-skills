@@ -156,6 +156,8 @@ function collectErrors(round) {
 
   if (!isPositiveInteger(round.maxRounds)) {
     errors.push("maxRounds must be a positive integer");
+  } else if (round.maxRounds > 10) {
+    errors.push("maxRounds must be at most 10");
   }
   if (!isPositiveInteger(round.round)) {
     errors.push("round must be a positive integer");

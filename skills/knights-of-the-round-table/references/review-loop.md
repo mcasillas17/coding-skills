@@ -4,6 +4,10 @@ This reference defines the exact state machine used to decide whether a review
 round is done, and the retry, fallback, deduplication, and repair rules that
 surround it. `scripts/review-round.mjs` implements `evaluateRound(round)`, which is
 the single source of truth for these states — never infer convergence from prose.
+The orchestrator must construct each round document from the validated effective
+configuration: `maxRounds` equals `maxReviewRounds`, and `requiredReviewers`
+contains exactly every effective reviewer role. Treat any mismatch as a hard
+orchestration error before calling the evaluator.
 
 ## Round states
 
@@ -34,6 +38,9 @@ For each configured reviewer role, in order:
    the run. Never silently reduce reviewer coverage by continuing with fewer roles
    than are configured — an unresolved role makes the round `incomplete`, not
    converged.
+
+Never continue, proceed, or publish with reduced reviewer coverage, known coverage
+gaps, or any required reviewer remaining incomplete.
 
 ## Deduplication and `reportedBy`
 
