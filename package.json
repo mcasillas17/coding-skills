@@ -1,0 +1,17 @@
+{
+  "name": "knights-of-the-round-table",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-harness implementation, review, documentation, and pull request skill",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "validate": "node scripts/validate.mjs",
+    "render": "node scripts/render-agents.mjs",
+    "check": "npm run render -- --check && npm run validate && npm test"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  }
+}
