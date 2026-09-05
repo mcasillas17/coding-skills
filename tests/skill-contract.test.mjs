@@ -75,6 +75,25 @@ function section(markdown, heading) {
   );
 }
 
+function assertFailClosedRule(markdown, { heading, required, forbidden, label }) {
+  const content = section(markdown, heading);
+  assert.match(
+    content,
+    /^\s*Stop and report the exact blocking condition and recovery step, preserving all\s+work, when any of the following occurs:\n\n-/i,
+    "failure conditions must begin with an exact, unconditional stop directive",
+  );
+  assert.doesNotMatch(
+    content,
+    /\bnon-blocking\b|\ball failure conditions are advisory\b|\bthe run may continue\b|\b(?:continue|proceed|ignore)\b[^.;]*(?:anyway|despite)/i,
+  );
+  assert.match(content, required, `${label} must be an explicit stop condition`);
+  assert.doesNotMatch(
+    content,
+    forbidden,
+    `${label} must never be inverted into permission to continue or succeed`,
+  );
+}
+
 let skillText;
 let frontmatter;
 
@@ -145,7 +164,7 @@ test("SKILL.md contains every required main section heading", () => {
   for (const heading of [
     "## Overview",
     "## Preconditions",
-    "## Resolve task",
+    "## Resolve the task",
     "## Implement",
     "## Review and repair loop",
     "## Documentation",
@@ -162,6 +181,15 @@ test("SKILL.md contains every required main section heading", () => {
     );
   }
   assert.match(skillText, /\*\*Core principle:\*\*/);
+});
+
+test("SKILL.md explains the required self-contained evaluator architecture", () => {
+  skillText = readText(SKILL_PATH);
+  const overview = section(skillText, "Overview");
+  assert.match(overview, /installed skill[^.]*self-contained/i);
+  assert.match(overview, /skill-local evaluator/i);
+  assert.match(overview, /root wrapper/i);
+  assert.match(overview, /both[^.]*required/i);
 });
 
 test("SKILL.md stays under 500 lines", () => {
@@ -301,6 +329,36 @@ test("SKILL.md requires reviewers to run independently and read-only", () => {
   assert.match(reviewLoop, /read-only/i);
 });
 
+test("reviewers are explicitly banned from editing, committing, pushing, or opening PRs", async (t) => {
+  skillText = readText(SKILL_PATH);
+  const reviewerBan =
+    /No reviewer may edit files, commit, push, or open a pull request\./i;
+
+  const normalizedReviewLoop = (markdown) =>
+    section(markdown, "Review and repair loop").replace(/\s+/g, " ");
+
+  assert.match(normalizedReviewLoop(skillText), reviewerBan);
+
+  const mutations = [
+    ["editing", /No reviewer may edit files,\s+/i, "No reviewer may "],
+    ["committing", /edit files,\s+commit,\s+/i, "edit files, "],
+    ["pushing", /commit,\s+push,\s+/i, "commit, "],
+    [
+      "opening PRs",
+      /push, or open\s+a pull request/i,
+      "push. Reviewers may open a pull request",
+    ],
+  ];
+
+  for (const [label, pattern, replacement] of mutations) {
+    await t.test(`rejects removal or permission for ${label}`, () => {
+      const mutant = skillText.replace(pattern, replacement);
+      assert.notEqual(mutant, skillText, `mutation must alter ${label}`);
+      assert.doesNotMatch(normalizedReviewLoop(mutant), reviewerBan);
+    });
+  }
+});
+
 test("SKILL.md requires the structured reviewer contract and scripts/review-round.mjs", () => {
   skillText = readText(SKILL_PATH);
   const reviewLoop = section(skillText, "Review and repair loop");
@@ -338,6 +396,42 @@ test("SKILL.md requires exactly one retry then one configured fallback attempt t
   );
 });
 
+test("approved fallback invariant: one fallback attempt is the only fallback design", () => {
+  skillText = readText(SKILL_PATH);
+
+  function assertSingleFallbackDesign(markdown) {
+    const reviewLoop = section(markdown, "Review and repair loop").replace(
+      /\s+/g,
+      " ",
+    );
+    assert.match(
+      reviewLoop,
+      /If the retry also fails, make one configured fallback attempt using that role's configured `fallbackRole`:/i,
+    );
+    assert.match(
+      reviewLoop,
+      /If that fallback attempt also fails,[^.]*then stop the run\./i,
+    );
+    assert.doesNotMatch(
+      reviewLoop,
+      /fallback chain|second fallback|another fallback|additional fallback|further fallback|one configured fallback attempt or more/i,
+    );
+  }
+
+  assertSingleFallbackDesign(skillText);
+
+  for (const mutant of [
+    skillText.replace("one configured fallback attempt", "fallback attempts"),
+    skillText.replace(
+      "one configured fallback attempt",
+      "one configured fallback attempt or more",
+    ),
+    skillText.replace("then stop the run", "then try another fallback"),
+  ]) {
+    assert.throws(() => assertSingleFallbackDesign(mutant));
+  }
+});
+
 test("fallback preserves the missing required role and effective coverage", () => {
   skillText = readText(SKILL_PATH);
   const reviewLoop = section(skillText, "Review and repair loop");
@@ -349,6 +443,36 @@ test("fallback preserves the missing required role and effective coverage", () =
     /(?:all six configured reviewer roles|with all six roles)/i,
     "the canonical six are defaults; a validated override defines the effective set",
   );
+});
+
+test("approved reviewer-floor invariant: the six canonical roles cannot be removed or disabled", () => {
+  skillText = readText(SKILL_PATH);
+
+  function assertSixRoleFloor(markdown) {
+    const preconditions = section(markdown, "Preconditions").replace(/\s+/g, " ");
+    assert.match(
+      preconditions,
+      /The override may add roles or remap agents and fallbacks, but it must not remove or disable the six canonical roles\./i,
+    );
+    assert.doesNotMatch(
+      preconditions,
+      /six canonical roles[^.]*(?:unless|except|opt out)/i,
+    );
+  }
+
+  assertSixRoleFloor(skillText);
+
+  for (const replacement of [
+    "",
+    "may remove or disable the six canonical roles",
+    "must not remove or disable the six canonical roles unless the repository opts out",
+  ]) {
+    const mutant = skillText.replace(
+      /must not remove or disable the six canonical\s+roles/i,
+      replacement,
+    );
+    assert.throws(() => assertSixRoleFloor(mutant));
+  }
 });
 
 test("SKILL.md forbids silently reducing reviewer coverage", () => {
@@ -400,6 +524,57 @@ test("SKILL.md states that reaching a round number never authorizes publication"
   assert.match(reviewLoop, /never[^.]*authorize/i);
 });
 
+test("semantic contract rejects round-10 publication authorization", () => {
+  skillText = readText(SKILL_PATH);
+
+  function assertRoundTenIsNotAuthorization(markdown) {
+    const reviewLoop = section(markdown, "Review and repair loop").replace(
+      /\s+/g,
+      " ",
+    );
+    assert.match(
+      reviewLoop,
+      /Reaching any particular round number, including round 10, never by itself authorizes publication\./i,
+    );
+    assert.doesNotMatch(
+      reviewLoop,
+      /round 10[^.]*(?:unless|except|permits publication|allows publication|may publish)|reaching round 10 authorizes publication/i,
+    );
+  }
+
+  assertRoundTenIsNotAuthorization(skillText);
+  const mutant = skillText.replace(
+    /Reaching any particular round number, including round 10, never by itself\s+authorizes publication\./i,
+    "Reaching round 10 authorizes publication.",
+  );
+  assert.notEqual(mutant, skillText, "round-10 mutation must alter SKILL.md");
+  assert.throws(() => assertRoundTenIsNotAuthorization(mutant));
+
+  const exceptionMutant = skillText.replace(
+    /never by itself\s+authorizes publication\./i,
+    "never by itself authorizes publication unless the effective limit is reached.",
+  );
+  assert.notEqual(
+    exceptionMutant,
+    skillText,
+    "round-10 exception mutation must alter SKILL.md",
+  );
+  assert.throws(() => assertRoundTenIsNotAuthorization(exceptionMutant));
+
+  for (const authorization of [
+    "Reaching round 10 permits publication.",
+    "Reaching round 10 allows publication.",
+    "At round 10, the workflow may publish.",
+  ]) {
+    const authorizationMutant = skillText.replace(
+      /Reaching any particular round number, including round 10, never by itself\s+authorizes publication\./i,
+      authorization,
+    );
+    assert.notEqual(authorizationMutant, skillText);
+    assert.throws(() => assertRoundTenIsNotAuthorization(authorizationMutant));
+  }
+});
+
 test("SKILL.md forbids opening any pull request, including a draft, without full clean coverage", () => {
   skillText = readText(SKILL_PATH);
   const publish = section(skillText, "Publish");
@@ -439,6 +614,53 @@ test("SKILL.md requires separate consent for sensitive, destructive, or producti
   assert.match(publish, /consent/i);
 });
 
+test("semantic contract rejects preauthorization of destructive, production, or sensitive actions", () => {
+  skillText = readText(SKILL_PATH);
+
+  function assertSensitiveActionsNeedConsent(markdown) {
+    const publish = section(markdown, "Publish").replace(/\s+/g, " ");
+    assert.match(
+      publish,
+      /Destructive actions, production changes, releases, purchases, or other separately sensitive operations still require the user's explicit, separate consent, even though normal commit, push, and PR creation are pre-authorized\./i,
+    );
+    assert.doesNotMatch(
+      publish,
+      /Destructive actions[^.]*(?:do not require|without)[^.]*consent|Destructive actions, production changes, releases, purchases, (?:and|or other separately) sensitive operations (?:are pre-authorized|are permitted)|invoking this skill[^.]*authorizes[^.]*(?:destructive|production|sensitive)/i,
+    );
+  }
+
+  assertSensitiveActionsNeedConsent(skillText);
+  const mutant = skillText.replace(
+    /Destructive actions, production changes, releases, purchases, or other\s+separately sensitive operations still require the user's explicit, separate\s+consent[^.]*\./i,
+    "Destructive actions, production changes, releases, purchases, and sensitive operations are pre-authorized.",
+  );
+  assert.notEqual(mutant, skillText, "sensitive-action mutation must alter SKILL.md");
+  assert.throws(() => assertSensitiveActionsNeedConsent(mutant));
+
+  const negationMutant = skillText.replace(
+    /still require the user's explicit, separate\s+consent/i,
+    "do not require the user's explicit, separate consent",
+  );
+  assert.notEqual(
+    negationMutant,
+    skillText,
+    "consent-negation mutation must alter SKILL.md",
+  );
+  assert.throws(() => assertSensitiveActionsNeedConsent(negationMutant));
+
+  for (const permission of [
+    "Destructive actions, production changes, releases, purchases, and sensitive operations are permitted without consent.",
+    "Invoking this skill authorizes destructive and production changes.",
+  ]) {
+    const permissionMutant = skillText.replace(
+      /Destructive actions, production changes, releases, purchases, or other\s+separately sensitive operations still require the user's explicit, separate\s+consent[^.]*\./i,
+      permission,
+    );
+    assert.notEqual(permissionMutant, skillText);
+    assert.throws(() => assertSensitiveActionsNeedConsent(permissionMutant));
+  }
+});
+
 test("SKILL.md fails closed when a dedicated task branch cannot be established", () => {
   skillText = readText(SKILL_PATH);
   const failures = section(skillText, "Failure conditions");
@@ -449,6 +671,215 @@ test("SKILL.md fails closed when a dedicated task branch cannot be established",
   assert.match(failures, /conflicting repository instructions/i);
   assert.match(failures, /override[^.]*schema validation[^.]*hard gate/is);
   assert.match(failures, /recovery step/i);
+});
+
+test("failure conditions stay fail-closed when each condition is removed or inverted", async (t) => {
+  skillText = readText(SKILL_PATH);
+  const rules = [
+    {
+      label: "no Git repository",
+      heading: "Failure conditions",
+      required: /^- no Git repository is found from the current working directory;$/im,
+      forbidden: /no Git repository[^.]*(?:continue|proceed|ignore|success)/i,
+      inverse: "no Git repository is found, but the run may continue;",
+    },
+    {
+      label: "unsupported task source",
+      heading: "Failure conditions",
+      required: /^- the task source is not an inline prompt or a readable local file;$/im,
+      forbidden: /(?:unsupported task source|task source is unsupported)[^.]*(?:continue|proceed|ignore|success)/i,
+      inverse: "unsupported task source detected, but continue;",
+    },
+    {
+      label: "ambiguous essential behavior",
+      heading: "Failure conditions",
+      required: /^- essential task behavior remains ambiguous after inspection;$/im,
+      forbidden: /ambiguous[^.]*(?:continue|proceed|ignore|success)|ambiguity[^.]*success/i,
+      inverse: "essential task behavior remains ambiguous after inspection, but continue;",
+    },
+    {
+      label: "conflicting repository instructions",
+      heading: "Failure conditions",
+      required: /^- conflicting repository instructions cannot be reconciled;$/im,
+      forbidden: /conflicting repository instructions[^.]*(?:continue|proceed|ignore|success)|instruction conflict[^.]*success/i,
+      inverse: "conflicting repository instructions cannot be reconciled, but continue;",
+    },
+    {
+      label: "unsafe unrelated changes",
+      heading: "Failure conditions",
+      required: /^- unrelated working-tree changes cannot be safely isolated;$/im,
+      forbidden: /unrelated working-tree changes[^.]*may be overwritten|cannot be safely isolated[^.]*(?:continue|proceed|ignore|success)/i,
+      inverse:
+        "unrelated working-tree changes cannot be safely isolated, but continue anyway;",
+    },
+    {
+      label: "missing dedicated task branch",
+      heading: "Failure conditions",
+      required: /^- a dedicated non-default task branch cannot be created or selected;$/im,
+      forbidden: /task branch cannot be created or selected[^.]*(?:continue|proceed|ignore|success)|missing task branch[^.]*success/i,
+      inverse:
+        "a dedicated non-default task branch cannot be created or selected, but continue;",
+    },
+    {
+      label: "invalid or weakening repository override",
+      heading: "Failure conditions",
+      required: /^- the repository override fails schema validation or weakens a hard gate;$/im,
+      forbidden: /override fails schema validation or weakens a hard gate[^.]*(?:continue|proceed|ignore|success)|invalid override[^.]*success/i,
+      inverse:
+        "the repository override fails schema validation or weakens a hard gate, but continue;",
+    },
+    {
+      label: "unavailable evaluator helper",
+      heading: "Failure conditions",
+      required: /^- the evaluator helper is unavailable;$/im,
+      forbidden: /evaluator helper is unavailable[^.]*(?:continue|proceed|ignore|success)|missing evaluator[^.]*success/i,
+      inverse: "the evaluator helper is unavailable, but continue;",
+    },
+    {
+      label: "failing required validation",
+      heading: "Failure conditions",
+      required: /^- required validation fails;$/im,
+      forbidden: /required validation fails[^.]*(?:continue|proceed|ignore|success)|required validation failure[^.]*success/i,
+      inverse: "required validation fails, but continue;",
+    },
+    {
+      label: "actionable findings at the round limit",
+      heading: "Failure conditions",
+      required: /^- actionable findings remain at the effective `maxReviewRounds` \(at most 10\),\s+which is a blocked run;$/im,
+      forbidden: /actionable findings remain[^.]*(?:continue|proceed|ignore|publish|success)|round limit[^.]*success/i,
+      inverse:
+        "actionable findings remain at the effective `maxReviewRounds` (at most 10), but continue;",
+    },
+    {
+      label: "reviewer unavailable with no fallback",
+      heading: "Failure conditions",
+      required: /^- a required reviewer role has no working primary agent or fallback;$/im,
+      forbidden: /no working primary agent or fallback[^.]*(?:continue|proceed|ignore|success)|missing reviewer[^.]*success/i,
+      inverse:
+        "a required reviewer role has no working primary agent or fallback, but continue;",
+    },
+    {
+      label: "missing push remote",
+      heading: "Failure conditions",
+      required: /^- there is no configured push remote;$/im,
+      forbidden: /no configured push remote[^.]*(?:continue|proceed|ignore|success)|missing remote[^.]*success/i,
+      inverse: "there is no configured push remote, but continue;",
+    },
+    {
+      label: "Git authentication failure",
+      heading: "Failure conditions",
+      required: /^- Git authentication fails;$/im,
+      forbidden: /Git authentication fails[^.]*(?:continue|proceed|ignore|success)|authentication failure[^.]*success/i,
+      inverse: "Git authentication fails, but continue;",
+    },
+    {
+      label: "push failure",
+      heading: "Failure conditions",
+      required: /^- the push fails;$/im,
+      forbidden: /the push fails[^.]*(?:continue|proceed|ignore|success)|push failure[^.]*success/i,
+      inverse: "the push fails, but continue;",
+    },
+    {
+      label: "pull request creation failure",
+      heading: "Failure conditions",
+      required: /^- pull request creation fails\.$/im,
+      forbidden: /pull request creation fails[^.]*(?:continue|proceed|ignore|success)|PR creation failure[^.]*success/i,
+      inverse: "pull request creation fails, but continue.",
+    },
+    {
+      label: "partial or blocked run",
+      heading: "Failure conditions",
+      required: /Never present a partial or blocked run as successful\./i,
+      forbidden: /(?:^|\n)Present a partial or blocked run as successful|partial or blocked run may be (?:presented|reported) as successful/i,
+      inverse: "A partial or blocked run may be reported as successful.",
+    },
+  ];
+
+  const directiveMutant = skillText.replace(
+    /Stop and report the exact blocking condition and recovery step, preserving all\s+work, when any of the following occurs:/i,
+    "Continue and report the exact non-blocking condition and recovery step when any of the following occurs:",
+  );
+  assert.notEqual(
+    directiveMutant,
+    skillText,
+    "failure-section directive mutation must alter SKILL.md",
+  );
+  assert.throws(() => assertFailClosedRule(directiveMutant, rules[0]));
+
+  const appendedDirectiveMutant = skillText.replace(
+    /when any of the following occurs:/i,
+    "when any of the following occurs: Continue anyway.",
+  );
+  assert.notEqual(
+    appendedDirectiveMutant,
+    skillText,
+    "appended directive mutation must alter SKILL.md",
+  );
+  assert.throws(() => assertFailClosedRule(appendedDirectiveMutant, rules[0]));
+
+  const globalPermissionMutant = skillText.replace(
+    "Never present a partial or blocked run as successful.",
+    "Never present a partial or blocked run as successful.\n\nAll failure conditions are advisory, and the run may continue.",
+  );
+  assert.notEqual(
+    globalPermissionMutant,
+    skillText,
+    "global permission mutation must alter SKILL.md",
+  );
+  assert.match(
+    section(globalPermissionMutant, "Failure conditions"),
+    /All failure conditions are advisory, and the run may continue\./,
+  );
+  assert.throws(() => assertFailClosedRule(globalPermissionMutant, rules[0]));
+
+  for (const rule of rules) {
+    await t.test(rule.label, async (conditionTest) => {
+      assertFailClosedRule(skillText, rule);
+
+      await conditionTest.test("removal is rejected", () => {
+        const mutant = skillText.replace(rule.required, "");
+        assert.notEqual(mutant, skillText, `${rule.label} removal must alter SKILL.md`);
+        assert.throws(() => assertFailClosedRule(mutant, rule));
+      });
+
+      await conditionTest.test("inversion is rejected", () => {
+        const mutant = skillText.replace(rule.required, rule.inverse);
+        assert.notEqual(mutant, skillText, `${rule.label} inversion must alter SKILL.md`);
+        assert.throws(() => assertFailClosedRule(mutant, rule));
+      });
+
+      await conditionTest.test("proceed-anyway inversion is rejected", () => {
+        const mutant = skillText.replace(
+          rule.required,
+          rule.inverse.replace(/continue|Present/i, "proceed anyway"),
+        );
+        assert.notEqual(
+          mutant,
+          skillText,
+          `${rule.label} proceed mutation must alter SKILL.md`,
+        );
+        assert.throws(() => assertFailClosedRule(mutant, rule));
+      });
+
+      await conditionTest.test("contradictory permission is rejected", () => {
+        const mutant = skillText.replace(
+          rule.required,
+          (matchedBullet) => `${matchedBullet}\n- ${rule.inverse}`,
+        );
+        assert.notEqual(
+          mutant,
+          skillText,
+          `${rule.label} contradiction must alter SKILL.md`,
+        );
+        assert.match(
+          section(mutant, rule.heading),
+          rule.forbidden,
+          `${rule.label} contradiction must exercise its negative safeguard`,
+        );
+        assert.throws(() => assertFailClosedRule(mutant, rule));
+      });
+    });
+  }
 });
 
 test("SKILL.md completion report records fallback execution provenance", () => {

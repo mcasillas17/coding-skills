@@ -22,6 +22,12 @@ blocked. Only a clean round permits final validation and an automatic pull reque
 required reviewer role has completed, and a pull request only opens once every round
 is clean.
 
+**Architecture / implementation:** The installed skill must remain self-contained.
+The skill-local evaluator at `scripts/review-round.mjs` and the source-package root
+wrapper at `../../scripts/review-round.mjs` are both required: installed copies
+execute the skill-local evaluator, while repository tooling uses the root wrapper
+to delegate to that same implementation.
+
 ## Preconditions
 
 Before doing any work:
@@ -58,7 +64,7 @@ Before doing any work:
    required validation, Git, or pull request capability is unavailable, stop and
    report it rather than treating a reviewer fallback as a substitute.
 
-## Resolve task
+## Resolve the task
 
 Normalize the inline prompt or local file into: objective, explicit requirements,
 constraints, acceptance criteria, affected surfaces, and expected documentation
