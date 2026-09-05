@@ -41,6 +41,7 @@ const TRANSACTION_VERSION = 1;
 const MANIFEST_STATE_COMPLETE = "complete";
 const MANIFEST_STATE_INSTALLING = "installing";
 const SKILL_SWAP_JOURNAL_SCHEMA_VERSION = 1;
+const SKILL_SWAP_JOURNAL_STATE_ALLOCATING = "allocating";
 const SKILL_SWAP_JOURNAL_STATE_PREPARED = "prepared";
 const INSTALLER_ID = "knights-install";
 const SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -1179,6 +1180,16 @@ function skillSwapJournalPath(targetDir) {
   );
 }
 
+function isValidSkillStageName(stageName, targetName, ownerProcessId) {
+  const prefix = `.${targetName}.knights-stage-${ownerProcessId}-`;
+  return (
+    stageName.startsWith(prefix) &&
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(
+      stageName.slice(prefix.length),
+    )
+  );
+}
+
 function readSkillSwapJournalIfExists(
   targetDir,
   journalPath = skillSwapJournalPath(targetDir),
@@ -1203,9 +1214,7 @@ function readSkillSwapJournalIfExists(
       `Refusing to install: unable to parse skill swap journal: ${journalPath}`,
     );
   }
-
   const targetName = basename(targetDir);
-  const stagePrefix = `.${targetName}.knights-stage-`;
   const validIdentity = (identity) =>
     identity !== null &&
     typeof identity === "object" &&
@@ -1214,31 +1223,52 @@ function readSkillSwapJournalIfExists(
     /^\d+$/.test(identity.device) &&
     typeof identity.inode === "string" &&
     /^\d+$/.test(identity.inode);
-  const valid =
+  const validFiles = (files) =>
+    isValidManifestFileList(files) &&
+    new Set(files.map((file) => file.path)).size === files.length &&
+    files.every(
+      (file) =>
+        file.path !== MANIFEST_FILENAME &&
+        isSafeRelativePath(file.path),
+    );
+  const journalIsObject =
     journal !== null &&
     typeof journal === "object" &&
-    !Array.isArray(journal) &&
+    !Array.isArray(journal);
+  const validPrior =
+    journalIsObject &&
+    ((journal.priorIdentity === null &&
+      Array.isArray(journal.priorFiles) &&
+      journal.priorFiles.length === 0 &&
+      journal.priorManifestSha256 === null) ||
+    (validIdentity(journal.priorIdentity) &&
+      validFiles(journal.priorFiles) &&
+      typeof journal.priorManifestSha256 === "string" &&
+      /^[0-9a-f]{64}$/.test(journal.priorManifestSha256)));
+  const validStageState =
+    journalIsObject &&
+    ((journal.state === SKILL_SWAP_JOURNAL_STATE_ALLOCATING &&
+      journal.stageIdentity === null) ||
+      (journal.state === SKILL_SWAP_JOURNAL_STATE_PREPARED &&
+        validIdentity(journal.stageIdentity)));
+  const valid =
+    journalIsObject &&
     journal.schemaVersion === SKILL_SWAP_JOURNAL_SCHEMA_VERSION &&
     journal.installer === INSTALLER_ID &&
-    journal.state === SKILL_SWAP_JOURNAL_STATE_PREPARED &&
+    validStageState &&
     Number.isSafeInteger(journal.ownerProcessId) &&
     journal.ownerProcessId > 0 &&
     journal.targetName === targetName &&
     typeof journal.stageName === "string" &&
-    journal.stageName.startsWith(stagePrefix) &&
-    !journal.stageName.includes("/") &&
-    validIdentity(journal.stageIdentity) &&
-    validIdentity(journal.priorIdentity) &&
-    isValidManifestFileList(journal.stagedFiles) &&
-    new Set(journal.stagedFiles.map((file) => file.path)).size ===
-      journal.stagedFiles.length &&
-    isValidManifestFileList(journal.priorFiles) &&
-    new Set(journal.priorFiles.map((file) => file.path)).size ===
-      journal.priorFiles.length &&
+    isValidSkillStageName(
+      journal.stageName,
+      targetName,
+      journal.ownerProcessId,
+    ) &&
+    validFiles(journal.stagedFiles) &&
+    validPrior &&
     typeof journal.stagedManifestSha256 === "string" &&
-    /^[0-9a-f]{64}$/.test(journal.stagedManifestSha256) &&
-    typeof journal.priorManifestSha256 === "string" &&
-    /^[0-9a-f]{64}$/.test(journal.priorManifestSha256);
+    /^[0-9a-f]{64}$/.test(journal.stagedManifestSha256);
   if (!valid) {
     throw new Error(`Invalid skill swap journal: ${journalPath}`);
   }
@@ -1255,6 +1285,48 @@ function readSkillSwapJournalIfExists(
     stageDir,
     contentHash: sha256(content),
     identity: directoryIdentity(stat),
+  };
+}
+
+function replaceSkillSwapJournal({
+  targetDir,
+  journalPath,
+  expectedHash,
+  expectedIdentity,
+  content,
+}) {
+  const currentJournal = readSkillSwapJournalIfExists(
+    targetDir,
+    journalPath,
+  );
+  if (
+    !currentJournal.exists ||
+    currentJournal.contentHash !== expectedHash ||
+    currentJournal.identity.device !== expectedIdentity.device ||
+    currentJournal.identity.inode !== expectedIdentity.inode
+  ) {
+    throw new Error(
+      `Refusing to install: skill swap journal changed before stage population: ${journalPath}`,
+    );
+  }
+
+  writeAtomicFile(journalPath, content);
+  const contentHash = sha256(Buffer.from(content, "utf8"));
+  const updatedJournal = readSkillSwapJournalIfExists(
+    targetDir,
+    journalPath,
+  );
+  if (
+    !updatedJournal.exists ||
+    updatedJournal.contentHash !== contentHash
+  ) {
+    throw new Error(
+      `Refusing to install: skill swap journal changed during stage preparation: ${journalPath}`,
+    );
+  }
+  return {
+    contentHash,
+    identity: updatedJournal.identity,
   };
 }
 
@@ -1452,6 +1524,142 @@ function assertSkillPayloadSnapshot({
     );
   }
   assertManifestFilesUncorrupted(directory, expectedFiles);
+}
+
+function validateInterruptedSkillStage({
+  directory,
+  expectedIdentity,
+  expectedFiles,
+  description,
+}) {
+  assertSerializedDirectoryIdentity(
+    directory,
+    expectedIdentity,
+    description,
+  );
+
+  const manifestPath = join(directory, MANIFEST_FILENAME);
+  const manifestStat = lstatIfExists(manifestPath);
+  if (
+    manifestStat !== null &&
+    (manifestStat.isSymbolicLink() || !manifestStat.isFile())
+  ) {
+    throw new Error(
+      `Refusing to install: ${description} manifest is not a regular file: ${manifestPath}`,
+    );
+  }
+
+  const expectedPaths = new Set(expectedFiles.map((file) => file.path));
+  for (const relativePath of walkExistingDestinationFiles(
+    directory,
+    expectedFiles,
+  )) {
+    const filePath = resolve(directory, relativePath);
+    if (
+      !expectedPaths.has(relativePath) ||
+      !isSafeRelativePath(relativePath) ||
+      !isContainedPath(directory, filePath)
+    ) {
+      throw new Error(
+        `Refusing to install: ${description} contains an untracked file: ${directory}`,
+      );
+    }
+  }
+  return {
+    exists: manifestStat !== null,
+    manifestPath,
+  };
+}
+
+function removeInterruptedSkillStage({
+  directory,
+  expectedIdentity,
+  expectedFiles,
+  description,
+}) {
+  const manifestResult = validateInterruptedSkillStage({
+    directory,
+    expectedIdentity,
+    expectedFiles,
+    description,
+  });
+
+  for (const file of expectedFiles) {
+    const filePath = resolve(directory, file.path);
+    assertSerializedDirectoryIdentity(
+      directory,
+      expectedIdentity,
+      description,
+    );
+    assertSafeAncestors(directory, filePath, description);
+    const stat = lstatIfExists(filePath);
+    if (stat === null) {
+      continue;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(
+        `Refusing to install: ${description} file changed during cleanup: ${filePath}`,
+      );
+    }
+    rmSync(filePath);
+    syncDirectory(dirname(filePath));
+  }
+
+  const ownedDirectories = [...expectedDestinationDirectories(expectedFiles)]
+    .sort((left, right) => {
+      const depthDifference =
+        right.split("/").length - left.split("/").length;
+      return depthDifference === 0
+        ? right.localeCompare(left)
+        : depthDifference;
+    });
+  for (const relativePath of ownedDirectories) {
+    const directoryPath = resolve(directory, relativePath);
+    assertSerializedDirectoryIdentity(
+      directory,
+      expectedIdentity,
+      description,
+    );
+    const stat = lstatIfExists(directoryPath);
+    if (stat === null) {
+      continue;
+    }
+    if (
+      stat.isSymbolicLink() ||
+      !stat.isDirectory() ||
+      readdirSync(directoryPath).length > 0
+    ) {
+      throw new Error(
+        `Refusing to install: ${description} directory changed during cleanup: ${directoryPath}`,
+      );
+    }
+    rmdirSync(directoryPath);
+    syncDirectory(dirname(directoryPath));
+  }
+
+  if (manifestResult.exists) {
+    validateInterruptedSkillStage({
+      directory,
+      expectedIdentity,
+      expectedFiles,
+      description,
+    });
+    rmSync(manifestResult.manifestPath);
+    syncDirectory(directory);
+  }
+
+  assertSerializedDirectoryIdentity(
+    directory,
+    expectedIdentity,
+    description,
+  );
+  if (readdirSync(directory).length > 0) {
+    throw new Error(
+      `Refusing to install: ${description} changed after cleanup: ${directory}`,
+    );
+  }
+  rmdirSync(directory);
+  syncDirectory(dirname(directory));
 }
 
 function validatePartiallyRemovedSkillDirectory({
@@ -1702,12 +1910,119 @@ function recoverInterruptedSkillSwap({
 
     const targetStat = lstatIfExists(targetDir);
     const stageStat = lstatIfExists(stageDir);
-    const backupDir = findSkillSwapBackupDirectory(
-      targetDir,
-      journal.priorIdentity,
-    );
+    const hadPriorInstall = journal.priorIdentity !== null;
+    const backupDir = hadPriorInstall
+      ? findSkillSwapBackupDirectory(targetDir, journal.priorIdentity)
+      : null;
     const backupStat =
       backupDir === null ? null : lstatIfExists(backupDir);
+
+    if (journal.state === SKILL_SWAP_JOURNAL_STATE_ALLOCATING) {
+      const assertPriorTargetState = () => {
+        const currentTargetStat = lstatIfExists(targetDir);
+        if (!hadPriorInstall) {
+          if (currentTargetStat !== null) {
+            throw new Error(
+              `Refusing to install: skill destination changed during interrupted stage creation: ${targetDir}`,
+            );
+          }
+          return;
+        }
+        assertSerializedDirectoryIdentity(
+          targetDir,
+          journal.priorIdentity,
+          "prior skill",
+        );
+        assertCompleteSkillDirectory({
+          directory: targetDir,
+          expectedManifestHash: journal.priorManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "prior skill",
+        });
+      };
+
+      if (backupStat !== null) {
+        throw new Error(
+          `Refusing to install: skill backup exists during interrupted stage creation: ${backupDir}`,
+        );
+      }
+      assertPriorTargetState();
+      if (stageStat !== null) {
+        if (
+          stageStat.isSymbolicLink() ||
+          !stageStat.isDirectory() ||
+          readdirSync(stageDir).length > 0
+        ) {
+          throw new Error(
+            `Refusing to install: unowned content exists at interrupted skill stage: ${stageDir}`,
+          );
+        }
+        assertRecoveryContext();
+        assertPriorTargetState();
+        rmdirSync(stageDir);
+        syncDirectory(parentDir);
+      }
+      assertRecoveryContext();
+      assertPriorTargetState();
+      rmSync(journalPath, { force: true });
+      syncDirectory(parentDir);
+      return;
+    }
+
+    if (!hadPriorInstall) {
+      if (targetStat === null) {
+        if (stageStat !== null) {
+          validateInterruptedSkillStage({
+            directory: stageDir,
+            expectedIdentity: journal.stageIdentity,
+            expectedFiles: journal.stagedFiles,
+            description: "skill install stage",
+          });
+          assertRecoveryContext();
+          assertPathStillMissing(targetDir, "skill destination");
+          removeInterruptedSkillStage({
+            directory: stageDir,
+            expectedIdentity: journal.stageIdentity,
+            expectedFiles: journal.stagedFiles,
+            description: "skill install stage",
+          });
+        }
+        assertRecoveryContext();
+        assertPathStillMissing(targetDir, "skill destination");
+        rmSync(journalPath, { force: true });
+        syncDirectory(parentDir);
+        return;
+      }
+
+      if (
+        !targetStat.isSymbolicLink() &&
+        targetStat.isDirectory() &&
+        String(targetStat.dev) === journal.stageIdentity.device &&
+        String(targetStat.ino) === journal.stageIdentity.inode
+      ) {
+        if (stageStat !== null) {
+          throw new Error(
+            `Refusing to install: interrupted skill install has duplicate stage paths: ${journalPath}`,
+          );
+        }
+        assertCompleteSkillDirectory({
+          directory: targetDir,
+          expectedManifestHash: journal.stagedManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "published skill",
+        });
+        assertRecoveryContext();
+        rmSync(journalPath, { force: true });
+        syncDirectory(parentDir);
+        return;
+      }
+
+      throw new Error(
+        `Refusing to install: unable to recover interrupted skill install: ${journalPath}`,
+      );
+    }
 
     if (targetStat === null && backupStat !== null) {
       assertCompleteSkillDirectory({
@@ -1718,13 +2033,10 @@ function recoverInterruptedSkillSwap({
         description: "skill swap backup",
       });
       if (stageStat !== null) {
-        validatePartiallyRemovedSkillDirectory({
+        validateInterruptedSkillStage({
           directory: stageDir,
           expectedIdentity: journal.stageIdentity,
-          expectedManifestHash: journal.stagedManifestSha256,
           expectedFiles: journal.stagedFiles,
-          skill,
-          allowedHarnesses,
           description: "skill swap stage",
         });
       }
@@ -1739,13 +2051,10 @@ function recoverInterruptedSkillSwap({
         description: "restored skill",
       });
       if (stageStat !== null) {
-        removeOwnedSkillDirectoryIncrementally({
+        removeInterruptedSkillStage({
           directory: stageDir,
           expectedIdentity: journal.stageIdentity,
-          expectedManifestHash: journal.stagedManifestSha256,
           expectedFiles: journal.stagedFiles,
-          skill,
-          allowedHarnesses,
           description: "skill swap stage",
         });
       }
@@ -1816,23 +2125,17 @@ function recoverInterruptedSkillSwap({
           description: "prior skill",
         });
         if (stageStat !== null) {
-          validatePartiallyRemovedSkillDirectory({
+          validateInterruptedSkillStage({
             directory: stageDir,
             expectedIdentity: journal.stageIdentity,
-            expectedManifestHash: journal.stagedManifestSha256,
             expectedFiles: journal.stagedFiles,
-            skill,
-            allowedHarnesses,
             description: "skill swap stage",
           });
           assertRecoveryContext();
-          removeOwnedSkillDirectoryIncrementally({
+          removeInterruptedSkillStage({
             directory: stageDir,
             expectedIdentity: journal.stageIdentity,
-            expectedManifestHash: journal.stagedManifestSha256,
             expectedFiles: journal.stagedFiles,
-            skill,
-            allowedHarnesses,
             description: "skill swap stage",
           });
         }
@@ -2237,16 +2540,98 @@ function installSkillGroup({
     );
   }
   const parentIdentity = directoryIdentity(parentStat);
-  mkdirSync(stageDir, { mode: 0o755 });
-  syncDirectory(parentDir);
-  const stageIdentity = directoryIdentity(lstatSync(stageDir));
+  const manifestFiles = sourceFiles.map((file) => ({
+    path: file.relativePath,
+    sha256: sha256(file.content),
+  }));
+  const manifest = buildManifest({
+    skill,
+    skillVersion,
+    source: resolvedProjectRoot,
+    harnesses: finalHarnesses,
+    files: manifestFiles,
+  });
+  const serializedSkillManifest = serializeManifest(manifest);
+  const stagedManifestSha256 = sha256(
+    Buffer.from(serializedSkillManifest, "utf8"),
+  );
+  const journalPath = skillSwapJournalPath(targetDir);
+  assertPathStillMissing(journalPath, "skill swap journal");
+  const journalBase = {
+    schemaVersion: SKILL_SWAP_JOURNAL_SCHEMA_VERSION,
+    installer: INSTALLER_ID,
+    ownerProcessId: process.pid,
+    targetName: basename(targetDir),
+    stageName: basename(stageDir),
+    priorIdentity:
+      targetIdentity === null
+        ? null
+        : serializedDirectoryIdentity(targetIdentity),
+    stagedFiles: normalizedManifestFiles(manifestFiles),
+    priorFiles:
+      targetIdentity === null ? [] : normalizedManifestFiles(expectedFiles),
+    stagedManifestSha256,
+    priorManifestSha256:
+      targetIdentity === null ? null : expectedManifestHash,
+  };
+  const allocatingJournal = {
+    ...journalBase,
+    state: SKILL_SWAP_JOURNAL_STATE_ALLOCATING,
+    stageIdentity: null,
+  };
+  const serializedAllocatingJournal =
+    `${JSON.stringify(allocatingJournal, null, 2)}\n`;
+  const allocatingJournalHash = sha256(
+    Buffer.from(serializedAllocatingJournal, "utf8"),
+  );
 
-  const stagedDirectories = new Set([stageDir]);
-  let activeJournalPath;
+  const stagedDirectories = new Set();
+  let stageCreated = false;
+  let stageIdentity;
+  let swapJournalHash = allocatingJournalHash;
+  let swapJournalIdentity;
   let stagePublished = false;
   let preserveStageForRecovery = false;
   try {
-    const manifestFiles = [];
+    writeExclusiveAtomicFile(journalPath, serializedAllocatingJournal);
+    const createdJournal = readSkillSwapJournalIfExists(targetDir);
+    if (
+      !createdJournal.exists ||
+      createdJournal.contentHash !== allocatingJournalHash
+    ) {
+      throw new Error(
+        `Refusing to install: skill swap journal changed during creation: ${journalPath}`,
+      );
+    }
+    swapJournalIdentity = createdJournal.identity;
+    ACTIVE_OWNERSHIP_JOURNALS.add(journalPath);
+
+    assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+    assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
+    mkdirSync(stageDir, { mode: 0o755 });
+    stageCreated = true;
+    syncDirectory(parentDir);
+    stageIdentity = directoryIdentity(lstatSync(stageDir));
+    stagedDirectories.add(stageDir);
+
+    const preparedJournal = {
+      ...journalBase,
+      state: SKILL_SWAP_JOURNAL_STATE_PREPARED,
+      stageIdentity: serializedDirectoryIdentity(stageIdentity),
+    };
+    const serializedPreparedJournal =
+      `${JSON.stringify(preparedJournal, null, 2)}\n`;
+    const updatedJournal = replaceSkillSwapJournal({
+      targetDir,
+      journalPath,
+      expectedHash: allocatingJournalHash,
+      expectedIdentity: swapJournalIdentity,
+      content: serializedPreparedJournal,
+    });
+    swapJournalHash = updatedJournal.contentHash;
+    swapJournalIdentity = updatedJournal.identity;
+    onInstallEvent({ phase: "after-skill-swap-journal", targetDir });
+
     for (const file of sourceFiles) {
       const filePath = resolve(stageDir, file.relativePath);
       if (!isContainedPath(stageDir, filePath)) {
@@ -2258,10 +2643,6 @@ function installSkillGroup({
       mkdirSync(fileDirectory, { recursive: true });
       addDirectoryChain(stagedDirectories, stageDir, fileDirectory);
       writeDurableNewFile(filePath, file.content);
-      manifestFiles.push({
-        path: file.relativePath,
-        sha256: sha256(file.content),
-      });
     }
 
     onInstallEvent({ phase: "before-skill-manifest", targetDir });
@@ -2273,14 +2654,6 @@ function installSkillGroup({
       expectedFiles: manifestFiles,
       description: "skill stage",
     });
-    const manifest = buildManifest({
-      skill,
-      skillVersion,
-      source: resolvedProjectRoot,
-      harnesses: finalHarnesses,
-      files: manifestFiles,
-    });
-    const serializedSkillManifest = serializeManifest(manifest);
     writeDurableNewFile(
       join(stageDir, MANIFEST_FILENAME),
       serializedSkillManifest,
@@ -2297,9 +2670,6 @@ function installSkillGroup({
     assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
     assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
     assertDirectoryIdentity(stageDir, stageIdentity, "skill stage");
-    const stagedManifestSha256 = sha256(
-      Buffer.from(serializedSkillManifest, "utf8"),
-    );
     assertCompleteSkillDirectory({
       directory: stageDir,
       expectedManifestHash: stagedManifestSha256,
@@ -2325,42 +2695,21 @@ function installSkillGroup({
         allowedHarnesses,
         description: "published skill",
       });
-    } else {
-      const backupDir = uniqueSiblingPath(targetDir, "knights-backup");
-      const journalPath = skillSwapJournalPath(targetDir);
-      assertPathStillMissing(journalPath, "skill swap journal");
-      const swapJournal = {
-        schemaVersion: SKILL_SWAP_JOURNAL_SCHEMA_VERSION,
-        installer: INSTALLER_ID,
-        state: SKILL_SWAP_JOURNAL_STATE_PREPARED,
-        ownerProcessId: process.pid,
-        targetName: basename(targetDir),
-        stageName: basename(stageDir),
-        stageIdentity: serializedDirectoryIdentity(stageIdentity),
-        priorIdentity: serializedDirectoryIdentity(targetIdentity),
-        stagedFiles: normalizedManifestFiles(manifestFiles),
-        priorFiles: normalizedManifestFiles(expectedFiles),
-        stagedManifestSha256,
-        priorManifestSha256: expectedManifestHash,
-      };
-      const serializedSwapJournal = `${JSON.stringify(swapJournal, null, 2)}\n`;
-      const swapJournalHash = sha256(
-        Buffer.from(serializedSwapJournal, "utf8"),
-      );
-      writeExclusiveAtomicFile(journalPath, serializedSwapJournal);
-      const createdJournal = readSkillSwapJournalIfExists(targetDir);
+      const currentJournal = readSkillSwapJournalIfExists(targetDir);
       if (
-        !createdJournal.exists ||
-        createdJournal.contentHash !== swapJournalHash
+        !currentJournal.exists ||
+        currentJournal.contentHash !== swapJournalHash ||
+        currentJournal.identity.device !== swapJournalIdentity.device ||
+        currentJournal.identity.inode !== swapJournalIdentity.inode
       ) {
         throw new Error(
-          `Refusing to install: skill swap journal changed during creation: ${journalPath}`,
+          `Refusing to install: skill swap journal changed during installation: ${journalPath}`,
         );
       }
-      const swapJournalIdentity = createdJournal.identity;
-      activeJournalPath = journalPath;
-      ACTIVE_OWNERSHIP_JOURNALS.add(journalPath);
-      onInstallEvent({ phase: "after-skill-swap-journal", targetDir });
+      rmSync(journalPath);
+      syncDirectory(parentDir);
+    } else {
+      const backupDir = uniqueSiblingPath(targetDir, "knights-backup");
       assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
       assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
       assertCompleteSkillDirectory({
@@ -2525,19 +2874,49 @@ function installSkillGroup({
       }
     }
   } finally {
-    if (activeJournalPath !== undefined) {
-      ACTIVE_OWNERSHIP_JOURNALS.delete(activeJournalPath);
-    }
+    ACTIVE_OWNERSHIP_JOURNALS.delete(journalPath);
     if (!stagePublished && !preserveStageForRecovery) {
       const stageStat = lstatIfExists(stageDir);
       if (
+        stageCreated &&
+        stageIdentity === undefined &&
+        stageStat !== null &&
+        !stageStat.isSymbolicLink() &&
+        stageStat.isDirectory() &&
+        readdirSync(stageDir).length === 0
+      ) {
+        rmdirSync(stageDir);
+        syncDirectory(parentDir);
+      } else if (
+        stageCreated &&
+        stageIdentity !== undefined &&
         stageStat !== null &&
         stageStat.dev === stageIdentity.device &&
         stageStat.ino === stageIdentity.inode &&
         !stageStat.isSymbolicLink() &&
         stageStat.isDirectory()
       ) {
-        rmSync(stageDir, { recursive: true, force: true });
+        removeInterruptedSkillStage({
+          directory: stageDir,
+          expectedIdentity: serializedDirectoryIdentity(stageIdentity),
+          expectedFiles: manifestFiles,
+          description: "skill stage",
+        });
+      }
+      if (
+        lstatIfExists(stageDir) === null &&
+        swapJournalIdentity !== undefined
+      ) {
+        const currentJournal = readSkillSwapJournalIfExists(targetDir);
+        if (
+          currentJournal.exists &&
+          currentJournal.contentHash === swapJournalHash &&
+          currentJournal.identity.device === swapJournalIdentity.device &&
+          currentJournal.identity.inode === swapJournalIdentity.inode
+        ) {
+          rmSync(journalPath);
+          syncDirectory(parentDir);
+        }
       }
     }
   }

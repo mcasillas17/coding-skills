@@ -212,6 +212,95 @@ function withHome(t) {
   return home;
 }
 
+function skillStageNames(directory, skill) {
+  const escapedSkill = skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const stagePattern = new RegExp(
+    `^\\.${escapedSkill}\\.knights-stage-[1-9]\\d*-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`,
+  );
+  return listEntries(directory).filter((entry) => stagePattern.test(entry));
+}
+
+function skillJournalNames(directory, skill) {
+  const fixedName = `.${skill}.knights-swap.json`;
+  const recoveryPrefix = `.${skill}.knights-swap.recovering-`;
+  return listEntries(directory).filter(
+    (entry) => entry === fixedName || entry.startsWith(recoveryPrefix),
+  );
+}
+
+function runHardExitSkillInstall({
+  projectRoot,
+  home,
+  phase,
+  force = false,
+  exitCode,
+}) {
+  const options = {
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  };
+  if (force) {
+    options.force = true;
+  }
+  const script = [
+    `import { install } from ${JSON.stringify(
+      pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+    )};`,
+    `const options = ${JSON.stringify(options)};`,
+    "install({",
+    "  ...options,",
+    "  onInstallEvent({ phase }) {",
+    `    if (phase === ${JSON.stringify(phase)}) process.exit(${exitCode});`,
+    "  },",
+    "});",
+    "",
+  ].join("\n");
+  return spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", script],
+    { encoding: "utf8" },
+  );
+}
+
+function runHardExitAfterSkillStageCreation({
+  projectRoot,
+  home,
+  exitCode,
+}) {
+  const options = {
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  };
+  const script = [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { basename } from "node:path";',
+    "const originalMkdirSync = fs.mkdirSync;",
+    "fs.mkdirSync = function patchedMkdirSync(path, ...args) {",
+    "  const result = originalMkdirSync.call(this, path, ...args);",
+    '  if (basename(String(path)).startsWith(".other-skill.knights-stage-")) {',
+    `    process.exit(${exitCode});`,
+    "  }",
+    "  return result;",
+    "};",
+    "syncBuiltinESMExports();",
+    `const { install } = await import(${JSON.stringify(
+      pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+    )});`,
+    `install(${JSON.stringify(options)});`,
+    "",
+  ].join("\n");
+  return spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", script],
+    { encoding: "utf8" },
+  );
+}
+
 test("installs the canonical skill and all harness reviewer agents", (t) => {
   const projectRoot = withFixture(t);
   const home = withHome(t);
@@ -660,6 +749,384 @@ test("interruption before the staged skill swap preserves the prior install", (t
     readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
     "updated fixture bytes\n",
   );
+});
+
+for (const [phase, exitCode] of [
+  ["before-skill-manifest", 81],
+  ["before-skill-swap", 82],
+]) {
+  test(`recovers a hard exit at ${phase} during first install`, (t) => {
+    const projectRoot = withFixture(t);
+    createGenericSkillFixture(projectRoot, "other-skill");
+    const home = withHome(t);
+    const skillsDir = join(home, ".claude/skills");
+    const installedSkillDir = join(skillsDir, "other-skill");
+    const similarlyNamedDir = join(
+      skillsDir,
+      ".other-skill.knights-stage-unrelated",
+    );
+    mkdirSync(similarlyNamedDir, { recursive: true });
+    writeFileSync(join(similarlyNamedDir, "keep.txt"), "unrelated\n");
+
+    const interrupted = runHardExitSkillInstall({
+      projectRoot,
+      home,
+      phase,
+      exitCode,
+    });
+
+    assert.equal(interrupted.status, exitCode, interrupted.stderr);
+    assert.equal(existsSync(installedSkillDir), false);
+    assert.equal(skillStageNames(skillsDir, "other-skill").length, 1);
+
+    install({
+      projectRoot,
+      home,
+      skill: "other-skill",
+      harnesses: ["claude"],
+    });
+
+    assert.equal(
+      readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+      "Additional fixture file.\n",
+    );
+    assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+    assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+    assert.equal(
+      readFileSync(join(similarlyNamedDir, "keep.txt"), "utf8"),
+      "unrelated\n",
+    );
+  });
+}
+
+for (const [phase, exitCode] of [
+  ["before-skill-manifest", 83],
+  ["before-skill-swap", 84],
+]) {
+  test(`recovers a hard exit at ${phase} during a force update`, (t) => {
+    const projectRoot = withFixture(t);
+    const sourceSkillDir = createGenericSkillFixture(
+      projectRoot,
+      "other-skill",
+    );
+    const home = withHome(t);
+    const skillsDir = join(home, ".claude/skills");
+    const installedSkillDir = join(skillsDir, "other-skill");
+    const unrelatedPath = join(skillsDir, "unrelated.txt");
+
+    install({
+      projectRoot,
+      home,
+      skill: "other-skill",
+      harnesses: ["claude"],
+    });
+    const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+    writeFileSync(unrelatedPath, "unrelated\n");
+    writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+    const interrupted = runHardExitSkillInstall({
+      projectRoot,
+      home,
+      phase,
+      force: true,
+      exitCode,
+    });
+
+    assert.equal(interrupted.status, exitCode, interrupted.stderr);
+    assert.deepEqual(readFileSync(join(installedSkillDir, "NOTES.md")), priorNotes);
+    assert.equal(skillStageNames(skillsDir, "other-skill").length, 1);
+
+    install({
+      projectRoot,
+      home,
+      skill: "other-skill",
+      harnesses: ["claude"],
+      force: true,
+    });
+
+    assert.equal(
+      readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+      "updated fixture bytes\n",
+    );
+    assert.equal(readFileSync(unrelatedPath, "utf8"), "unrelated\n");
+    assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+    assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+  });
+}
+
+test("recovers after repeated hard exits without leaving accumulated skill stages", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const skillsDir = join(home, ".claude/skills");
+  const installedSkillDir = join(skillsDir, "other-skill");
+  const similarlyNamedDir = join(
+    skillsDir,
+    ".other-skill.knights-stage-user-data",
+  );
+  mkdirSync(similarlyNamedDir, { recursive: true });
+  writeFileSync(join(similarlyNamedDir, "keep.txt"), "keep me\n");
+
+  for (const [phase, exitCode] of [
+    ["before-skill-manifest", 85],
+    ["before-skill-swap", 86],
+    ["before-skill-manifest", 87],
+  ]) {
+    const interrupted = runHardExitSkillInstall({
+      projectRoot,
+      home,
+      phase,
+      exitCode,
+    });
+    assert.equal(interrupted.status, exitCode, interrupted.stderr);
+    assert.equal(existsSync(installedSkillDir), false);
+    assert.ok(skillStageNames(skillsDir, "other-skill").length >= 1);
+  }
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "Additional fixture file.\n",
+  );
+  assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+  assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+  assert.equal(
+    readFileSync(join(similarlyNamedDir, "keep.txt"), "utf8"),
+    "keep me\n",
+  );
+});
+
+test("recovers a hard exit immediately after creating a first-install skill stage", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const skillsDir = join(home, ".claude/skills");
+  const installedSkillDir = join(skillsDir, "other-skill");
+  const similarlyNamedDir = join(
+    skillsDir,
+    ".other-skill.knights-stage-user-owned",
+  );
+  mkdirSync(similarlyNamedDir, { recursive: true });
+  writeFileSync(join(similarlyNamedDir, "keep.txt"), "keep me\n");
+
+  const interrupted = runHardExitAfterSkillStageCreation({
+    projectRoot,
+    home,
+    exitCode: 90,
+  });
+
+  assert.equal(interrupted.status, 90, interrupted.stderr);
+  assert.equal(existsSync(installedSkillDir), false);
+  assert.equal(skillStageNames(skillsDir, "other-skill").length, 1);
+  assert.equal(skillJournalNames(skillsDir, "other-skill").length, 1);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "Additional fixture file.\n",
+  );
+  assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+  assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+  assert.equal(
+    readFileSync(join(similarlyNamedDir, "keep.txt"), "utf8"),
+    "keep me\n",
+  );
+});
+
+for (const { phase, exitCode, corrupt } of [
+  {
+    phase: "before-skill-manifest",
+    exitCode: 91,
+    corrupt(stageDir) {
+      writeFileSync(join(stageDir, "NOTES.md"), "partial payload");
+    },
+  },
+  {
+    phase: "before-skill-swap",
+    exitCode: 92,
+    corrupt(stageDir) {
+      writeFileSync(join(stageDir, ".knights-install.json"), '{"partial":');
+    },
+  },
+]) {
+  test(`recovers owned partial writes after a hard exit at ${phase}`, (t) => {
+    const projectRoot = withFixture(t);
+    createGenericSkillFixture(projectRoot, "other-skill");
+    const home = withHome(t);
+    const skillsDir = join(home, ".claude/skills");
+    const installedSkillDir = join(skillsDir, "other-skill");
+
+    const interrupted = runHardExitSkillInstall({
+      projectRoot,
+      home,
+      phase,
+      exitCode,
+    });
+    assert.equal(interrupted.status, exitCode, interrupted.stderr);
+
+    const [stageName] = skillStageNames(skillsDir, "other-skill");
+    assert.equal(typeof stageName, "string");
+    corrupt(join(skillsDir, stageName));
+
+    install({
+      projectRoot,
+      home,
+      skill: "other-skill",
+      harnesses: ["claude"],
+    });
+
+    assert.equal(
+      readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+      "Additional fixture file.\n",
+    );
+    assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+    assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+  });
+}
+
+test("refuses to recover a skill stage while its owner is active", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  let concurrentInstallWasRefused = false;
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    onInstallEvent({ phase }) {
+      if (phase !== "before-skill-manifest") {
+        return;
+      }
+      assert.throws(
+        () =>
+          install({
+            projectRoot,
+            home,
+            skill: "other-skill",
+            harnesses: ["claude"],
+          }),
+        /in progress/i,
+      );
+      concurrentInstallWasRefused = true;
+    },
+  });
+
+  assert.equal(concurrentInstallWasRefused, true);
+});
+
+test("refuses to delete a replacement at a journaled skill stage path", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const skillsDir = join(home, ".claude/skills");
+  const journalPath = join(
+    skillsDir,
+    ".other-skill.knights-swap.json",
+  );
+
+  const interrupted = runHardExitSkillInstall({
+    projectRoot,
+    home,
+    phase: "before-skill-manifest",
+    exitCode: 88,
+  });
+  assert.equal(interrupted.status, 88, interrupted.stderr);
+
+  const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+  const stageDir = join(skillsDir, journal.stageName);
+  const displacedStageDir = join(skillsDir, "preserved-owned-stage");
+  renameSync(stageDir, displacedStageDir);
+  mkdirSync(stageDir);
+  writeFileSync(join(stageDir, "unrelated.txt"), "do not delete\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+      }),
+    /changed|identity|interrupted/i,
+  );
+  assert.equal(
+    readFileSync(join(stageDir, "unrelated.txt"), "utf8"),
+    "do not delete\n",
+  );
+
+  rmSync(stageDir, { recursive: true });
+  renameSync(displacedStageDir, stageDir);
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+  assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
+});
+
+test("refuses a journaled skill stage path outside its target parent", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const skillsDir = join(home, ".claude/skills");
+  const journalPath = join(
+    skillsDir,
+    ".other-skill.knights-swap.json",
+  );
+  const outsideDir = join(home, "outside-stage");
+  mkdirSync(outsideDir);
+  writeFileSync(join(outsideDir, "keep.txt"), "outside\n");
+
+  const interrupted = runHardExitSkillInstall({
+    projectRoot,
+    home,
+    phase: "before-skill-manifest",
+    exitCode: 89,
+  });
+  assert.equal(interrupted.status, 89, interrupted.stderr);
+
+  const originalJournal = readFileSync(journalPath);
+  const forgedJournal = JSON.parse(originalJournal.toString("utf8"));
+  forgedJournal.stageName = "../../outside-stage";
+  writeFileSync(journalPath, `${JSON.stringify(forgedJournal, null, 2)}\n`);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+      }),
+    /invalid skill swap journal/i,
+  );
+  assert.equal(readFileSync(join(outsideDir, "keep.txt"), "utf8"), "outside\n");
+
+  writeFileSync(journalPath, originalJournal);
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  assert.deepEqual(skillStageNames(skillsDir, "other-skill"), []);
+  assert.deepEqual(skillJournalNames(skillsDir, "other-skill"), []);
 });
 
 test("refuses an existing unowned collision without force", (t) => {
