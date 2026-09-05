@@ -69,15 +69,17 @@ The source installer places skill and companion agents in the selected user home
 For a disposable isolated check from the source checkout:
 
 ```sh
-node scripts/install.mjs --harness codex --home /tmp/knights-isolated-home
-node scripts/install.mjs --harness gemini --home /tmp/knights-isolated-home
+test_home="$(mktemp -d)"
+node scripts/install.mjs --skill knights-of-the-round-table --harness codex --harness gemini --home "$test_home"
 ```
 
 For a user's approved real installation, omit `--home`. Do not install globally
 just to test a package. Use `--harness claude`, `--harness copilot` or
 `--harness all` for other standalone installs. Codex and Gemini share the skill
 copy under `.agents/skills`; the installer preserves/updates installed sibling
-agents together and retains executable modes.
+agents together and retains executable modes. Select both harnesses together on
+first install, as above. Adding a harness to an existing shared copy requires
+`--force`, just like updating it.
 
 **Codex plugin installation alone does not register generated custom agent
 roles.** Its manifest exposes skills, not an agents directory. Run the existing
