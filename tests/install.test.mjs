@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -15,13 +16,14 @@ import {
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { install } from "../scripts/install.mjs";
 import { renderAll } from "../scripts/render-agents.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const TRANSACTION_FILENAME = ".knights-install.transaction.json";
 
 const GENERATED_AGENT_SOURCE_DIRS = {
   claude: "generated/claude/agents",
@@ -185,6 +187,12 @@ function readManifest(directory) {
   );
 }
 
+function readTransactionManifest(directory) {
+  return JSON.parse(
+    readFileSync(join(directory, TRANSACTION_FILENAME), "utf8"),
+  );
+}
+
 function listEntries(directory) {
   if (!existsSync(directory)) {
     return [];
@@ -320,6 +328,32 @@ test("refuses force when an owned install directory contains an untracked extra 
   );
 });
 
+test("refuses force when an owned install directory contains an untracked empty directory", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const installedSkillDir = join(
+    home,
+    ".claude/skills/knights-of-the-round-table",
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const untrackedDirectory = join(installedSkillDir, "user-empty-directory");
+  mkdirSync(untrackedDirectory);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /files do not match|untracked/i,
+  );
+
+  assert.equal(existsSync(untrackedDirectory), true);
+});
+
 test("refuses to mutate a destination whose ownership manifest is a symlink", (t) => {
   const projectRoot = withFixture(t);
   const home = withHome(t);
@@ -354,6 +388,37 @@ test("refuses to mutate a destination whose ownership manifest is a symlink", (t
   rmSync(externalFile, { recursive: true, force: true });
 });
 
+test("refuses a null ownership manifest with a controlled error", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const installedSkillDir = join(
+    home,
+    ".claude/skills/knights-of-the-round-table",
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const installedSkill = readFileSync(join(installedSkillDir, "SKILL.md"));
+  const manifestPath = join(installedSkillDir, ".knights-install.json");
+  writeFileSync(manifestPath, "null\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /invalid ownership manifest: .*\.knights-install\.json/i,
+  );
+
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, "SKILL.md")),
+    installedSkill,
+  );
+  assert.equal(readFileSync(manifestPath, "utf8"), "null\n");
+});
+
 test("manifest records schema version, source, hashes, and installed files", (t) => {
   const projectRoot = withFixture(t);
   const home = withHome(t);
@@ -365,7 +430,9 @@ test("manifest records schema version, source, hashes, and installed files", (t)
     ".claude/skills/knights-of-the-round-table",
   );
   const manifest = readManifest(skillDir);
-  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.schemaVersion, 2);
+  assert.equal(manifest.transactionVersion, 1);
+  assert.equal(manifest.state, "complete");
   assert.equal(manifest.skill, "knights-of-the-round-table");
   assert.equal(manifest.skillVersion, "0.1.0");
   assert.equal(manifest.source, projectRoot);
@@ -380,12 +447,219 @@ test("manifest records schema version, source, hashes, and installed files", (t)
 
   const agentsDir = join(home, ".claude/agents");
   const agentsManifest = readManifest(agentsDir);
-  assert.equal(agentsManifest.schemaVersion, 1);
+  assert.equal(agentsManifest.schemaVersion, 2);
+  assert.equal(agentsManifest.transactionVersion, 1);
+  assert.equal(agentsManifest.state, "complete");
   assert.deepEqual(agentsManifest.harnesses, ["claude"]);
   for (const file of agentsManifest.files) {
     const actual = readFileSync(join(agentsDir, file.path));
     assert.equal(sha256(actual), file.sha256, file.path);
   }
+});
+
+test("installs the validated skill snapshot when the source changes after validation", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const external = tempDir("knights-install-snapshot-external-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  const originalSkill = readFileSync(join(sourceSkillDir, "SKILL.md"));
+  const originalNotes = readFileSync(join(sourceSkillDir, "NOTES.md"));
+  const externalNotes = join(external, "NOTES.md");
+  writeFileSync(externalNotes, "unvalidated external bytes\n");
+
+  let sourceWasMutated = false;
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    onInstallEvent({ phase }) {
+      if (phase !== "source-validated") {
+        return;
+      }
+      sourceWasMutated = true;
+      writeFileSync(
+        join(sourceSkillDir, "SKILL.md"),
+        skillMarkdown({ name: "other-skill", version: "9.9.9" }),
+      );
+      rmSync(join(sourceSkillDir, "NOTES.md"));
+      symlinkSync(externalNotes, join(sourceSkillDir, "NOTES.md"));
+      writeFileSync(
+        join(sourceSkillDir, "PLANTED.md"),
+        "created after validation\n",
+      );
+    },
+  });
+
+  assert.equal(sourceWasMutated, true, "the mutation must cross the validation boundary");
+
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, "SKILL.md")),
+    originalSkill,
+  );
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, "NOTES.md")),
+    originalNotes,
+  );
+  assert.equal(lstatSync(join(installedSkillDir, "NOTES.md")).isFile(), true);
+  assert.equal(existsSync(join(installedSkillDir, "PLANTED.md")), false);
+
+  const manifest = readManifest(installedSkillDir);
+  assert.deepEqual(
+    manifest.files.map((file) => file.path),
+    ["NOTES.md", "SKILL.md"],
+  );
+  for (const file of manifest.files) {
+    const installedBytes = readFileSync(join(installedSkillDir, file.path));
+    assert.equal(file.sha256, sha256(installedBytes), file.path);
+  }
+});
+
+test("interruption before the staged skill manifest preserves the prior install", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  const priorManifest = readFileSync(
+    join(installedSkillDir, ".knights-install.json"),
+  );
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "before-skill-manifest") {
+            throw new Error("injected before skill manifest");
+          }
+        },
+      }),
+    /injected before skill manifest/,
+  );
+
+  assert.deepEqual(readFileSync(join(installedSkillDir, "NOTES.md")), priorNotes);
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, ".knights-install.json")),
+    priorManifest,
+  );
+  assert.deepEqual(listEntries(dirname(installedSkillDir)), ["other-skill"]);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+  });
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
+});
+
+test("rechecks the skill stage after the pre-manifest hook before writing metadata", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const skillsDir = join(home, ".claude/skills");
+  const external = tempDir("knights-install-stage-race-external-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        onInstallEvent({ phase }) {
+          if (phase !== "before-skill-manifest") {
+            return;
+          }
+          const stageName = listEntries(skillsDir).find((entry) =>
+            entry.startsWith(".other-skill.knights-stage-"),
+          );
+          assert.equal(typeof stageName, "string");
+          const stageDir = join(skillsDir, stageName);
+          rmSync(stageDir, { recursive: true, force: true });
+          symlinkSync(external, stageDir);
+        },
+      }),
+    /changed|symlink/i,
+  );
+
+  assert.deepEqual(listEntries(external), []);
+});
+
+test("interruption before the staged skill swap preserves the prior install", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  const priorManifest = readFileSync(
+    join(installedSkillDir, ".knights-install.json"),
+  );
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "before-skill-swap") {
+            throw new Error("injected before skill swap");
+          }
+        },
+      }),
+    /injected before skill swap/,
+  );
+
+  assert.deepEqual(readFileSync(join(installedSkillDir, "NOTES.md")), priorNotes);
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, ".knights-install.json")),
+    priorManifest,
+  );
+  assert.deepEqual(listEntries(dirname(installedSkillDir)), ["other-skill"]);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+  });
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
 });
 
 test("refuses an existing unowned collision without force", (t) => {
@@ -500,6 +774,36 @@ test("force updates an existing owned install", (t) => {
     ),
     "Updated review guidance.\n",
   );
+});
+
+test("force replaces a hash-consistent installed skill whose old config is no longer valid", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const skillDir = join(
+    home,
+    ".claude/skills/knights-of-the-round-table",
+  );
+  const configPath = join(skillDir, "config/reviewers.yaml");
+  const manifestPath = join(skillDir, ".knights-install.json");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const oldConfig = readFileSync(configPath, "utf8").replace(
+    "maxReviewRounds: 10",
+    "maxReviewRounds: 12",
+  );
+  writeFileSync(configPath, oldConfig);
+  const manifest = readManifest(skillDir);
+  manifest.files.find(
+    (file) => file.path === "config/reviewers.yaml",
+  ).sha256 = sha256(Buffer.from(oldConfig, "utf8"));
+  writeFileSync(
+    manifestPath,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  assert.match(readFileSync(configPath, "utf8"), /maxReviewRounds: 10/);
 });
 
 test("fails closed on force when an installed file has drifted", (t) => {
@@ -747,6 +1051,1739 @@ function resyncGeneratedAgentSourceDir(projectRoot, harness) {
     writeFileSync(join(directory, filename), content);
   }
 }
+
+function updateFixtureReviewerSources(
+  projectRoot,
+  {
+    correctness = "Updated correctness review guidance.\n",
+    security = "Updated security review guidance.\n",
+  } = {},
+) {
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/reviewers/correctness.md",
+    ),
+    correctness,
+  );
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/reviewers/security.md",
+    ),
+    security,
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+}
+
+function readAgentPayloads(agentsDir, filenames) {
+  return Object.fromEntries(
+    filenames.map((filename) => [
+      filename,
+      readFileSync(join(agentsDir, filename)),
+    ]),
+  );
+}
+
+test("interruption before the agent transaction manifest preserves the prior agent install", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  writeFileSync(
+    join(agentsDir, "unrelated-agent.md"),
+    "not managed by knights\n",
+  );
+  const priorManifest = readFileSync(
+    join(agentsDir, ".knights-install.json"),
+  );
+  const priorPayloads = readAgentPayloads(
+    agentsDir,
+    readManifest(agentsDir).files.map((file) => file.path),
+  );
+  updateFixtureReviewerSources(projectRoot);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "before-agent-transaction-manifest") {
+            throw new Error("injected before agent transaction manifest");
+          }
+        },
+      }),
+    /injected before agent transaction manifest/,
+  );
+
+  assert.deepEqual(
+    readFileSync(join(agentsDir, ".knights-install.json")),
+    priorManifest,
+  );
+  for (const [filename, priorBytes] of Object.entries(priorPayloads)) {
+    assert.deepEqual(readFileSync(join(agentsDir, filename)), priorBytes);
+  }
+  assert.equal(
+    readFileSync(join(agentsDir, "unrelated-agent.md"), "utf8"),
+    "not managed by knights\n",
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+  const rendered = renderAll({ projectRoot }).claude;
+  for (const [filename, content] of Object.entries(rendered)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+});
+
+test("force recovers an interruption after the agent transaction manifest", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const priorManifest = readManifest(agentsDir);
+  const priorPayloads = readAgentPayloads(
+    agentsDir,
+    priorManifest.files.map((file) => file.path),
+  );
+  updateFixtureReviewerSources(projectRoot);
+  const desiredPayloads = renderAll({ projectRoot }).claude;
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-transaction-manifest") {
+            throw new Error("injected after agent transaction manifest");
+          }
+        },
+      }),
+    /injected after agent transaction manifest/,
+  );
+
+  assert.deepEqual(readManifest(agentsDir), priorManifest);
+  const interruptedManifest = readTransactionManifest(agentsDir);
+  assert.equal(interruptedManifest.schemaVersion, 2);
+  assert.equal(interruptedManifest.transactionVersion, 1);
+  assert.equal(interruptedManifest.state, "installing");
+  for (const [filename, priorBytes] of Object.entries(priorPayloads)) {
+    assert.deepEqual(readFileSync(join(agentsDir, filename)), priorBytes);
+  }
+
+  const missingFilename = interruptedManifest.files.at(-1).path;
+  rmSync(join(agentsDir, missingFilename));
+  writeFileSync(
+    join(agentsDir, "unrelated-agent.md"),
+    "not managed by knights\n",
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"] }),
+    /force/i,
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+  for (const [filename, content] of Object.entries(desiredPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  const recoveredManifest = readManifest(agentsDir);
+  assert.equal(recoveredManifest.state, "complete");
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+  assert.equal(
+    readFileSync(join(agentsDir, "unrelated-agent.md"), "utf8"),
+    "not managed by knights\n",
+  );
+});
+
+test("force recovers an interrupted agent transaction after the source changes again", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  updateFixtureReviewerSources(projectRoot);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-transaction-manifest") {
+            throw new Error("injected after agent transaction manifest");
+          }
+        },
+      }),
+    /injected after agent transaction manifest/,
+  );
+
+  updateFixtureReviewerSources(projectRoot, {
+    correctness: "Third correctness review guidance.\n",
+    security: "Third security review guidance.\n",
+  });
+  const newestPayloads = renderAll({ projectRoot }).claude;
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  for (const [filename, content] of Object.entries(newestPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("force recovers a first agent install after the source changes", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-file") {
+            throw new Error("injected during first agent install");
+          }
+        },
+      }),
+    /injected during first agent install/,
+  );
+  assert.equal(
+    existsSync(join(agentsDir, ".knights-install.json")),
+    false,
+  );
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), true);
+
+  updateFixtureReviewerSources(projectRoot);
+  const newestPayloads = renderAll({ projectRoot }).claude;
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  for (const [filename, content] of Object.entries(newestPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("retains intermediate agent ownership when recovery is interrupted again", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName(
+      "security",
+      "claude",
+      "security-reviewer-v2",
+    ),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase, filename }) {
+          if (
+            phase === "after-agent-file" &&
+            filename === "security-reviewer-v2.md"
+          ) {
+            throw new Error("injected after intermediate agent write");
+          }
+        },
+      }),
+    /injected after intermediate agent write/,
+  );
+
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName(
+      "security",
+      "claude",
+      "security-reviewer-v3",
+    ),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+  let transactionManifestCount = 0;
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (
+            phase === "after-agent-transaction-manifest" &&
+            ++transactionManifestCount === 2
+          ) {
+            throw new Error("injected during second recovery");
+          }
+        },
+      }),
+    /injected during second recovery/,
+  );
+
+  const newestPayloads = renderAll({ projectRoot }).claude;
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  for (const [filename, content] of Object.entries(newestPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(
+    existsSync(join(agentsDir, "security-reviewer-v2.md")),
+    false,
+  );
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("force recovers an agent transaction after a later skill update is also interrupted", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({
+    projectRoot,
+    home,
+    harnesses: ["claude", "copilot"],
+  });
+  updateFixtureReviewerSources(projectRoot);
+  resyncGeneratedAgentSourceDir(projectRoot, "copilot");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude", "copilot"],
+        force: true,
+        onInstallEvent({ phase, harness }) {
+          if (
+            phase === "after-agent-transaction-manifest" &&
+            harness === "claude"
+          ) {
+            throw new Error("injected after claude transaction manifest");
+          }
+        },
+      }),
+    /injected after claude transaction manifest/,
+  );
+
+  updateFixtureReviewerSources(projectRoot, {
+    correctness: "Third correctness review guidance.\n",
+    security: "Third security review guidance.\n",
+  });
+  resyncGeneratedAgentSourceDir(projectRoot, "copilot");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude", "copilot"],
+        force: true,
+        onInstallEvent({ phase, targetDir }) {
+          if (
+            phase === "before-skill-manifest" &&
+            targetDir.includes("/.copilot/skills/")
+          ) {
+            throw new Error("injected during later skill update");
+          }
+        },
+      }),
+    /injected during later skill update/,
+  );
+
+  const newestPayloads = renderAll({ projectRoot }).claude;
+  install({
+    projectRoot,
+    home,
+    harnesses: ["claude", "copilot"],
+    force: true,
+  });
+
+  for (const [filename, content] of Object.entries(newestPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("updating a shared skill recovers an interrupted unselected sibling first", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const codexAgentsDir = join(home, ".codex/agents");
+  const unrelatedPath = join(codexAgentsDir, "unrelated.toml");
+
+  install({
+    projectRoot,
+    home,
+    harnesses: ["codex", "gemini"],
+  });
+  writeFileSync(unrelatedPath, "unrelated = true\n");
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName(
+      "security",
+      "codex",
+      "security-reviewer-v2",
+    ),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "codex");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["codex"],
+        force: true,
+        onInstallEvent({ phase, filename }) {
+          if (
+            phase === "after-agent-file" &&
+            filename === "security-reviewer-v2.toml"
+          ) {
+            throw new Error("injected during codex agent update");
+          }
+        },
+      }),
+    /injected during codex agent update/,
+  );
+  assert.equal(
+    existsSync(join(codexAgentsDir, "security-reviewer-v2.toml")),
+    true,
+  );
+
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName(
+      "security",
+      "codex",
+      "security-reviewer-v3",
+    ),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "codex");
+
+  install({
+    projectRoot,
+    home,
+    harnesses: ["gemini"],
+    force: true,
+  });
+  install({
+    projectRoot,
+    home,
+    harnesses: ["codex"],
+    force: true,
+  });
+
+  assert.equal(
+    existsSync(join(codexAgentsDir, "security-reviewer-v2.toml")),
+    false,
+  );
+  assert.equal(
+    existsSync(join(codexAgentsDir, "security-reviewer-v3.toml")),
+    true,
+  );
+  assert.equal(
+    existsSync(join(codexAgentsDir, TRANSACTION_FILENAME)),
+    false,
+  );
+  assert.equal(readFileSync(unrelatedPath, "utf8"), "unrelated = true\n");
+});
+
+test("an active agent transaction cannot be taken over by a concurrent install", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  updateFixtureReviewerSources(projectRoot);
+  let concurrentInstallWasRefused = false;
+
+  install({
+    projectRoot,
+    home,
+    harnesses: ["claude"],
+    force: true,
+    onInstallEvent({ phase }) {
+      if (phase !== "after-agent-transaction-manifest") {
+        return;
+      }
+      assert.throws(
+        () =>
+          install({
+            projectRoot,
+            home,
+            harnesses: ["claude"],
+            force: true,
+          }),
+        /in progress/i,
+      );
+      concurrentInstallWasRefused = true;
+    },
+  });
+
+  assert.equal(concurrentInstallWasRefused, true);
+});
+
+test("force recovers an interruption between atomic agent file writes", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const priorManifest = readManifest(agentsDir);
+  const filenames = priorManifest.files.map((file) => file.path);
+  const priorPayloads = readAgentPayloads(agentsDir, filenames);
+  updateFixtureReviewerSources(projectRoot);
+  const desiredPayloads = renderAll({ projectRoot }).claude;
+  let writtenFilename;
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase, filename }) {
+          if (phase === "after-agent-file") {
+            writtenFilename = filename;
+            throw new Error("injected between agent writes");
+          }
+        },
+      }),
+    /injected between agent writes/,
+  );
+
+  assert.equal(typeof writtenFilename, "string");
+  assert.equal(readManifest(agentsDir).state, "complete");
+  assert.equal(readTransactionManifest(agentsDir).state, "installing");
+  assert.equal(
+    readFileSync(join(agentsDir, writtenFilename), "utf8"),
+    desiredPayloads[writtenFilename],
+  );
+  for (const filename of filenames.filter(
+    (candidate) => candidate !== writtenFilename,
+  )) {
+    assert.deepEqual(
+      readFileSync(join(agentsDir, filename)),
+      priorPayloads[filename],
+    );
+  }
+  assert.equal(
+    listEntries(agentsDir).some((entry) => entry.includes(".knights-tmp-")),
+    false,
+  );
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+  for (const [filename, content] of Object.entries(desiredPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(readManifest(agentsDir).state, "complete");
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("a completed agent transaction does not block a later source update", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  updateFixtureReviewerSources(projectRoot);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "before-agent-transaction-cleanup") {
+            throw new Error("injected before agent transaction cleanup");
+          }
+        },
+      }),
+    /injected before agent transaction cleanup/,
+  );
+  assert.equal(readManifest(agentsDir).state, "complete");
+  assert.equal(readTransactionManifest(agentsDir).state, "installing");
+
+  updateFixtureReviewerSources(projectRoot, {
+    correctness: "Third correctness review guidance.\n",
+    security: "Third security review guidance.\n",
+  });
+  const newestPayloads = renderAll({ projectRoot }).claude;
+
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+
+  for (const [filename, content] of Object.entries(newestPayloads)) {
+    assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
+  }
+  assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+});
+
+test("interrupted agent ownership refuses external drift and destination symlinks", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+  const external = tempDir("knights-install-agent-recovery-external-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  updateFixtureReviewerSources(projectRoot);
+  assert.throws(() =>
+    install({
+      projectRoot,
+      home,
+      harnesses: ["claude"],
+      force: true,
+      onInstallEvent({ phase }) {
+        if (phase === "after-agent-transaction-manifest") {
+          throw new Error("injected after agent transaction manifest");
+        }
+      },
+    }),
+  );
+
+  const filename = readTransactionManifest(agentsDir).files[0].path;
+  const filePath = join(agentsDir, filename);
+  writeFileSync(filePath, "external drift\n");
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /drifted|unmanaged/i,
+  );
+  assert.equal(readFileSync(filePath, "utf8"), "external drift\n");
+
+  rmSync(filePath);
+  const externalFile = join(external, filename);
+  writeFileSync(externalFile, "external bytes\n");
+  symlinkSync(externalFile, filePath);
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /regular file|symlink/i,
+  );
+  assert.equal(lstatSync(filePath).isSymbolicLink(), true);
+  assert.equal(readFileSync(externalFile, "utf8"), "external bytes\n");
+});
+
+test("interrupted agent ownership refuses an unowned collision at a newly tracked path", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  writeFileSync(
+    join(
+      projectRoot,
+      "skills/knights-of-the-round-table/config/reviewers.yaml",
+    ),
+    skillYamlWithHarnessName("security", "claude", "security-reviewer-v2"),
+  );
+  resyncGeneratedAgentSourceDir(projectRoot, "claude");
+
+  assert.throws(() =>
+    install({
+      projectRoot,
+      home,
+      harnesses: ["claude"],
+      force: true,
+      onInstallEvent({ phase }) {
+        if (phase === "after-agent-transaction-manifest") {
+          throw new Error("injected after agent transaction manifest");
+        }
+      },
+    }),
+  );
+
+  const unownedPath = join(agentsDir, "security-reviewer-v2.md");
+  writeFileSync(unownedPath, "unowned collision\n");
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /drifted|unmanaged/i,
+  );
+  assert.equal(readFileSync(unownedPath, "utf8"), "unowned collision\n");
+  assert.equal(
+    existsSync(join(agentsDir, "security-reviewer.md")),
+    true,
+    "the prior owned file must survive the refused recovery",
+  );
+});
+
+test("refuses a forged transaction state without mutating owned agent files", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const manifest = readManifest(agentsDir);
+  const payloads = readAgentPayloads(
+    agentsDir,
+    manifest.files.map((file) => file.path),
+  );
+  manifest.state = "installing";
+  manifest.transactionVersion = 999;
+  manifest.previousFiles = manifest.files;
+  writeFileSync(
+    join(agentsDir, ".knights-install.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /invalid ownership manifest/i,
+  );
+  for (const [filename, priorBytes] of Object.entries(payloads)) {
+    assert.deepEqual(readFileSync(join(agentsDir, filename)), priorBytes);
+  }
+});
+
+test("refuses a forged transaction journal that claims an unrelated agent file", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+  const unrelatedFilename = "unrelated-agent.md";
+  const unrelatedContent = "not managed by knights\n";
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(join(agentsDir, unrelatedFilename), unrelatedContent);
+
+  const desiredFiles = Object.entries(renderAll({ projectRoot }).claude).map(
+    ([path, content]) => ({
+      path,
+      sha256: sha256(Buffer.from(content, "utf8")),
+    }),
+  );
+  const forgedTransaction = {
+    schemaVersion: 2,
+    transactionVersion: 1,
+    state: "installing",
+    installer: "knights-install",
+    skill: "knights-of-the-round-table",
+    skillVersion: "0.1.0",
+    source: projectRoot,
+    harnesses: ["claude"],
+    previousManifestSha256: null,
+    ownerProcessId: process.pid,
+    files: [
+      ...desiredFiles,
+      {
+        path: unrelatedFilename,
+        sha256: sha256(Buffer.from(unrelatedContent)),
+      },
+    ],
+  };
+  writeFileSync(
+    join(agentsDir, TRANSACTION_FILENAME),
+    `${JSON.stringify(forgedTransaction, null, 2)}\n`,
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /invalid ownership manifest|transaction/i,
+  );
+  assert.equal(
+    readFileSync(join(agentsDir, unrelatedFilename), "utf8"),
+    unrelatedContent,
+  );
+  assert.deepEqual(readTransactionManifest(agentsDir), forgedTransaction);
+});
+
+test("a forged skill snapshot cannot authorize an unrelated agent transaction claim", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+  const skillDir = join(
+    home,
+    ".claude/skills/knights-of-the-round-table",
+  );
+  const unrelatedFilename = "unrelated-agent.md";
+  const unrelatedContent = Buffer.from("not managed by knights\n");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  writeFileSync(join(agentsDir, unrelatedFilename), unrelatedContent);
+
+  const desiredFiles = Object.entries(renderAll({ projectRoot }).claude).map(
+    ([path, content]) => ({
+      path,
+      sha256: sha256(Buffer.from(content, "utf8")),
+    }),
+  );
+  const forgedFiles = [
+    ...desiredFiles,
+    {
+      path: unrelatedFilename,
+      sha256: sha256(unrelatedContent),
+    },
+  ];
+  const skillManifest = readManifest(skillDir);
+  skillManifest.generatedAgentFiles = { claude: forgedFiles };
+  writeFileSync(
+    join(skillDir, ".knights-install.json"),
+    `${JSON.stringify(skillManifest, null, 2)}\n`,
+  );
+
+  const agentManifestBytes = readFileSync(
+    join(agentsDir, ".knights-install.json"),
+  );
+  const forgedTransaction = {
+    schemaVersion: 2,
+    transactionVersion: 1,
+    state: "installing",
+    installer: "knights-install",
+    skill: "knights-of-the-round-table",
+    skillVersion: "0.1.0",
+    source: projectRoot,
+    harnesses: ["claude"],
+    previousManifestSha256: sha256(agentManifestBytes),
+    ownerProcessId: process.pid,
+    files: forgedFiles,
+  };
+  writeFileSync(
+    join(agentsDir, TRANSACTION_FILENAME),
+    `${JSON.stringify(forgedTransaction, null, 2)}\n`,
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /transaction.*installed or validated agent source|forged|unmanaged|unowned/i,
+  );
+  assert.deepEqual(
+    readFileSync(join(agentsDir, unrelatedFilename)),
+    unrelatedContent,
+  );
+});
+
+test("refuses an agent transaction journal that is not linked to the completed manifest", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const priorManifest = readFileSync(
+    join(agentsDir, ".knights-install.json"),
+  );
+  const priorPayloads = readAgentPayloads(
+    agentsDir,
+    readManifest(agentsDir).files.map((file) => file.path),
+  );
+  updateFixtureReviewerSources(projectRoot);
+  const desiredFiles = Object.entries(renderAll({ projectRoot }).claude).map(
+    ([path, content]) => ({
+      path,
+      sha256: sha256(Buffer.from(content, "utf8")),
+    }),
+  );
+  const forgedTransaction = {
+    schemaVersion: 2,
+    transactionVersion: 1,
+    state: "installing",
+    installer: "knights-install",
+    skill: "knights-of-the-round-table",
+    skillVersion: "0.1.0",
+    source: projectRoot,
+    harnesses: ["claude"],
+    ownerProcessId: process.pid,
+    files: desiredFiles,
+    previousManifestSha256: "0".repeat(64),
+  };
+  writeFileSync(
+    join(agentsDir, TRANSACTION_FILENAME),
+    `${JSON.stringify(forgedTransaction, null, 2)}\n`,
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /not linked/i,
+  );
+  assert.deepEqual(
+    readFileSync(join(agentsDir, ".knights-install.json")),
+    priorManifest,
+  );
+  for (const [filename, priorBytes] of Object.entries(priorPayloads)) {
+    assert.deepEqual(readFileSync(join(agentsDir, filename)), priorBytes);
+  }
+});
+
+test("rechecks the agent directory after the transaction hook before writing payload", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+  const displacedAgentsDir = join(home, ".claude/agents-prior");
+  const external = tempDir("knights-install-agent-race-external-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  const priorManifest = readManifest(agentsDir);
+  const priorPayloads = readAgentPayloads(
+    agentsDir,
+    priorManifest.files.map((file) => file.path),
+  );
+  updateFixtureReviewerSources(projectRoot);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-transaction-manifest") {
+            renameSync(agentsDir, displacedAgentsDir);
+            symlinkSync(external, agentsDir);
+          }
+        },
+      }),
+    /changed|symlink/i,
+  );
+
+  assert.equal(lstatSync(agentsDir).isSymbolicLink(), true);
+  assert.deepEqual(listEntries(external), []);
+  for (const [filename, priorBytes] of Object.entries(priorPayloads)) {
+    assert.deepEqual(
+      readFileSync(join(displacedAgentsDir, filename)),
+      priorBytes,
+    );
+  }
+});
+
+test("rechecks an owned agent file after the transaction hook before replacing it", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const agentsDir = join(home, ".claude/agents");
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+  updateFixtureReviewerSources(projectRoot);
+  const racedFilename = "correctness-reviewer.md";
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-transaction-manifest") {
+            writeFileSync(
+              join(agentsDir, racedFilename),
+              "changed after preflight\n",
+            );
+          }
+        },
+      }),
+    /changed|drifted/i,
+  );
+
+  assert.equal(
+    readFileSync(join(agentsDir, racedFilename), "utf8"),
+    "changed after preflight\n",
+  );
+  assert.equal(readTransactionManifest(agentsDir).state, "installing");
+});
+
+test("rechecks the skill destination after staging before swapping it", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const displacedSkillDir = join(home, ".claude/skills/other-skill-prior");
+  const external = tempDir("knights-install-skill-race-external-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "before-skill-swap") {
+            renameSync(installedSkillDir, displacedSkillDir);
+            symlinkSync(external, installedSkillDir);
+          }
+        },
+      }),
+    /changed|symlink/i,
+  );
+
+  assert.equal(lstatSync(installedSkillDir).isSymbolicLink(), true);
+  assert.deepEqual(listEntries(external), []);
+  assert.deepEqual(
+    readFileSync(join(displacedSkillDir, "NOTES.md")),
+    priorNotes,
+  );
+});
+
+test("rechecks skill ancestors after moving the prior install to its backup", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const claudeDir = join(home, ".claude");
+  const installedSkillDir = join(claudeDir, "skills/other-skill");
+  const external = tempDir("knights-install-skill-ancestor-race-");
+  const movedClaudeDir = join(external, "claude");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-skill-backup") {
+            renameSync(claudeDir, movedClaudeDir);
+            symlinkSync(movedClaudeDir, claudeDir);
+          }
+        },
+      }),
+    /symlink|changed|restore prior install/i,
+  );
+
+  assert.equal(lstatSync(claudeDir).isSymbolicLink(), true);
+  assert.equal(existsSync(join(movedClaudeDir, "skills/other-skill")), false);
+  const backupName = listEntries(join(movedClaudeDir, "skills")).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  assert.deepEqual(
+    readFileSync(
+      join(movedClaudeDir, "skills", backupName, "NOTES.md"),
+    ),
+    priorNotes,
+  );
+});
+
+test("an active skill swap journal cannot be taken over by a concurrent install", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+  let concurrentInstallWasRefused = false;
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+    onInstallEvent({ phase }) {
+      if (phase !== "after-skill-swap-journal") {
+        return;
+      }
+      assert.throws(
+        () =>
+          install({
+            projectRoot,
+            home,
+            skill: "other-skill",
+            harnesses: ["claude"],
+            force: true,
+          }),
+        /in progress/i,
+      );
+      concurrentInstallWasRefused = true;
+    },
+  });
+
+  assert.equal(concurrentInstallWasRefused, true);
+});
+
+test("the skill swap journal does not expose an unreserved backup path", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+  let journalWasOpaque = false;
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+    onInstallEvent({ phase }) {
+      if (phase === "after-skill-swap-journal") {
+        const journal = JSON.parse(
+          readFileSync(
+            join(
+              home,
+              ".claude/skills/.other-skill.knights-swap.json",
+            ),
+            "utf8",
+          ),
+        );
+        assert.equal("backupName" in journal, false);
+        journalWasOpaque = true;
+      }
+    },
+  });
+
+  assert.equal(journalWasOpaque, true);
+});
+
+test("recovers a hard interruption after moving the prior skill to its backup", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const runnerDir = tempDir("knights-install-swap-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-swap.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "after-skill-backup") process.exit(86);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 86, interrupted.stderr);
+  assert.equal(existsSync(installedSkillDir), false);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+  });
+
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
+  assert.deepEqual(listEntries(dirname(installedSkillDir)), ["other-skill"]);
+});
+
+test("rollback restores the validated backup even if the swap journal is removed", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const journalPath = join(
+    home,
+    ".claude/skills/.other-skill.knights-swap.json",
+  );
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase === "after-skill-backup") {
+            rmSync(journalPath);
+            throw new Error("injected after removing swap journal");
+          }
+        },
+      }),
+    /injected after removing swap journal/,
+  );
+
+  assert.deepEqual(
+    readFileSync(join(installedSkillDir, "NOTES.md")),
+    priorNotes,
+  );
+  assert.equal(existsSync(journalPath), false);
+  assert.deepEqual(listEntries(dirname(installedSkillDir)), ["other-skill"]);
+});
+
+test("an interrupted skill swap recovery cannot be taken over concurrently", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const runnerDir = tempDir("knights-install-recovery-lock-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-swap.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "after-skill-backup") process.exit(89);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 89, interrupted.stderr);
+
+  let concurrentRecoveryWasRefused = false;
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+    onInstallEvent({ phase }) {
+      if (phase !== "after-skill-recovery-claim") {
+        return;
+      }
+      assert.throws(
+        () =>
+          install({
+            projectRoot,
+            home,
+            skill: "other-skill",
+            harnesses: ["claude"],
+            force: true,
+          }),
+        /in progress/i,
+      );
+      concurrentRecoveryWasRefused = true;
+    },
+  });
+
+  assert.equal(concurrentRecoveryWasRefused, true);
+});
+
+test("does not roll back to a backup that changed after it was moved", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+        onInstallEvent({ phase }) {
+          if (phase !== "after-skill-backup") {
+            return;
+          }
+          const backupName = listEntries(skillsDir).find((entry) =>
+            entry.startsWith(".other-skill.knights-backup-"),
+          );
+          assert.equal(typeof backupName, "string");
+          writeFileSync(
+            join(skillsDir, backupName, "NOTES.md"),
+            "changed after backup rename\n",
+          );
+          throw new Error("injected after corrupting skill backup");
+        },
+      }),
+    /injected|restore prior install|manifest|drifted/i,
+  );
+
+  assert.equal(
+    existsSync(installedSkillDir),
+    false,
+    "an invalid backup must not be republished",
+  );
+  assert.equal(
+    listEntries(skillsDir).some((entry) =>
+      entry.startsWith(".other-skill.knights-backup-"),
+    ),
+    true,
+  );
+  assert.equal(
+    listEntries(skillsDir).includes(".other-skill.knights-swap.json"),
+    true,
+  );
+});
+
+test("recovers when interruption leaves a partially removed skill backup", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+  const runnerDir = tempDir("knights-install-cleanup-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-cleanup.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "before-skill-backup-cleanup") process.exit(87);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 87, interrupted.stderr);
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
+
+  const backupName = listEntries(skillsDir).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  rmSync(join(skillsDir, backupName, "NOTES.md"));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+  });
+
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
+  assert.deepEqual(listEntries(skillsDir), ["other-skill"]);
+});
+
+test("refuses to delete changed or untracked files from a partially cleaned skill backup", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+  const runnerDir = tempDir("knights-install-cleanup-safety-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  const priorNotes = readFileSync(join(installedSkillDir, "NOTES.md"));
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-cleanup.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "before-skill-backup-cleanup") process.exit(88);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 88, interrupted.stderr);
+  const backupName = listEntries(skillsDir).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  const backupDir = join(skillsDir, backupName);
+
+  writeFileSync(join(backupDir, "NOTES.md"), "changed during cleanup\n");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /changed|drifted|manifest/i,
+  );
+  assert.equal(
+    readFileSync(join(backupDir, "NOTES.md"), "utf8"),
+    "changed during cleanup\n",
+  );
+
+  writeFileSync(join(backupDir, "NOTES.md"), priorNotes);
+  writeFileSync(join(backupDir, "untracked.txt"), "do not delete\n");
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /files do not match|untracked|changed/i,
+  );
+  assert.equal(
+    readFileSync(join(backupDir, "untracked.txt"), "utf8"),
+    "do not delete\n",
+  );
+});
+
+test("a forged swap journal cannot authorize deletion of an untracked backup file", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+  const journalPath = join(
+    skillsDir,
+    ".other-skill.knights-swap.json",
+  );
+  const runnerDir = tempDir("knights-install-forged-swap-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-cleanup.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "before-skill-backup-cleanup") process.exit(91);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 91, interrupted.stderr);
+
+  const backupName = listEntries(skillsDir).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  const backupDir = join(skillsDir, backupName);
+  const untrackedContent = Buffer.from("do not delete\n");
+  writeFileSync(join(backupDir, "untracked.txt"), untrackedContent);
+
+  const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+  journal.priorFiles.push({
+    path: "untracked.txt",
+    sha256: sha256(untrackedContent),
+  });
+  writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /manifest|untracked|forged|files do not match/i,
+  );
+  assert.equal(
+    readFileSync(join(backupDir, "untracked.txt"), "utf8"),
+    "do not delete\n",
+  );
+});
+
+test("recovery refuses a nonempty skill backup whose ownership manifest is missing", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+  const runnerDir = tempDir("knights-install-missing-backup-manifest-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-cleanup.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "before-skill-backup-cleanup") process.exit(92);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 92, interrupted.stderr);
+
+  const backupName = listEntries(skillsDir).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  const backupDir = join(skillsDir, backupName);
+  rmSync(join(backupDir, ".knights-install.json"));
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }),
+    /ownership manifest.*missing|manifest.*required/i,
+  );
+  assert.equal(
+    readFileSync(join(backupDir, "NOTES.md"), "utf8"),
+    "Additional fixture file.\n",
+  );
+});
+
+test("keeps backup ownership metadata until payload cleanup completes", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceSkillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const installedSkillDir = join(home, ".claude/skills/other-skill");
+  const skillsDir = dirname(installedSkillDir);
+  const runnerDir = tempDir("knights-install-manifest-last-runner-");
+  t.after(() => rmSync(runnerDir, { recursive: true, force: true }));
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+  });
+  writeFileSync(join(sourceSkillDir, "NOTES.md"), "updated fixture bytes\n");
+
+  const runnerPath = join(runnerDir, "interrupt-manifest-cleanup.mjs");
+  writeFileSync(
+    runnerPath,
+    [
+      `import { install } from ${JSON.stringify(
+        pathToFileURL(join(repositoryRoot, "scripts/install.mjs")).href,
+      )};`,
+      `install(${JSON.stringify({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+        force: true,
+      }).replace(/}$/, "")},`,
+      "  onInstallEvent({ phase }) {",
+      '    if (phase === "before-skill-backup-manifest-cleanup") process.exit(93);',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = spawnSync(process.execPath, [runnerPath], {
+    encoding: "utf8",
+  });
+  assert.equal(interrupted.status, 93, interrupted.stderr);
+  assert.equal(
+    readFileSync(join(installedSkillDir, "NOTES.md"), "utf8"),
+    "updated fixture bytes\n",
+  );
+
+  const backupName = listEntries(skillsDir).find((entry) =>
+    entry.startsWith(".other-skill.knights-backup-"),
+  );
+  assert.equal(typeof backupName, "string");
+  assert.deepEqual(listEntries(join(skillsDir, backupName)), [
+    ".knights-install.json",
+  ]);
+
+  install({
+    projectRoot,
+    home,
+    skill: "other-skill",
+    harnesses: ["claude"],
+    force: true,
+  });
+
+  assert.deepEqual(listEntries(skillsDir), ["other-skill"]);
+});
 
 test("force update removes a stale owned agent file, preserves unrelated files, and allows re-adding the freed name", (t) => {
   const projectRoot = withFixture(t);
@@ -1152,6 +3189,31 @@ test("installs a non-canonical skill without copying reviewer agents", (t) => {
     true,
   );
   assert.equal(existsSync(join(home, ".claude/agents")), false);
+});
+
+test("rejects unsafe source skill paths before any destination mutation", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows cannot create a filename containing a colon");
+    return;
+  }
+
+  const projectRoot = withFixture(t);
+  const skillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  writeFileSync(join(skillDir, "notes:v1.md"), "unsafe path fixture\n");
+  const home = withHome(t);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+      }),
+    /skill source contains an unsafe path: notes:v1\.md/i,
+  );
+
+  assert.deepEqual(listEntries(home), []);
 });
 
 test("rejects a source skill containing a top-level reserved manifest filename before any destination mutation", (t) => {

@@ -1,29 +1,50 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
-  cpSync,
+  closeSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
 import { isMainModule } from "./is-main-module.mjs";
-import { isSafeRelativePath } from "./validate.mjs";
-import { renderAll } from "./render-agents.mjs";
+import { assertValidConfig, isSafeRelativePath } from "./validate.mjs";
+import { renderAgents, renderAll } from "./render-agents.mjs";
 
 const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const DEFAULT_SKILL = "knights-of-the-round-table";
 const MANIFEST_FILENAME = ".knights-install.json";
-const MANIFEST_SCHEMA_VERSION = 1;
+const TRANSACTION_FILENAME = ".knights-install.transaction.json";
+const LEGACY_MANIFEST_SCHEMA_VERSION = 1;
+const MANIFEST_SCHEMA_VERSION = 2;
+const TRANSACTION_VERSION = 1;
+const MANIFEST_STATE_COMPLETE = "complete";
+const MANIFEST_STATE_INSTALLING = "installing";
+const SKILL_SWAP_JOURNAL_SCHEMA_VERSION = 1;
+const SKILL_SWAP_JOURNAL_STATE_PREPARED = "prepared";
 const INSTALLER_ID = "knights-install";
 const SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const ACTIVE_OWNERSHIP_JOURNALS = new Set();
 
 // Canonical harness order: every list this module produces (installedPaths,
 // manifest.harnesses, CLI output) is sorted according to this order so
@@ -83,6 +104,116 @@ function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
 }
 
+function uniqueSiblingPath(targetPath, label) {
+  return join(
+    dirname(targetPath),
+    `.${basename(targetPath)}.${label}-${process.pid}-${randomUUID()}`,
+  );
+}
+
+function writeDurableNewFile(filePath, content) {
+  let fileDescriptor;
+  try {
+    fileDescriptor = openSync(filePath, "wx");
+    writeFileSync(fileDescriptor, content);
+    fsyncSync(fileDescriptor);
+  } finally {
+    if (fileDescriptor !== undefined) {
+      closeSync(fileDescriptor);
+    }
+  }
+}
+
+function writeAtomicFile(filePath, content) {
+  const temporaryPath = uniqueSiblingPath(filePath, "knights-tmp");
+  try {
+    writeDurableNewFile(temporaryPath, content);
+    renameSync(temporaryPath, filePath);
+    syncDirectory(dirname(filePath));
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function writeExclusiveAtomicFile(filePath, content) {
+  const temporaryPath = uniqueSiblingPath(filePath, "knights-tmp");
+  try {
+    writeDurableNewFile(temporaryPath, content);
+    try {
+      linkSync(temporaryPath, filePath);
+    } catch (error) {
+      if (error.code === "EEXIST") {
+        throw new Error(
+          `Refusing to install: another installation is in progress: ${filePath}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    syncDirectory(dirname(filePath));
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function syncDirectory(directory) {
+  let fileDescriptor;
+  try {
+    fileDescriptor = openSync(directory, "r");
+    fsyncSync(fileDescriptor);
+  } catch (error) {
+    if (
+      !["EBADF", "EINVAL", "EISDIR", "ENOTSUP", "EPERM"].includes(
+        error.code,
+      )
+    ) {
+      throw error;
+    }
+  } finally {
+    if (fileDescriptor !== undefined) {
+      closeSync(fileDescriptor);
+    }
+  }
+}
+
+function directoryChain(rootDirectory, leafDirectory) {
+  const root = resolve(rootDirectory);
+  const leaf = resolve(leafDirectory);
+  const relativePath = relative(root, leaf);
+  if (
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error(`Directory chain escapes its root: ${leaf}`);
+  }
+
+  const directories = [root];
+  let current = root;
+  if (relativePath !== "") {
+    for (const segment of relativePath.split(sep)) {
+      current = join(current, segment);
+      directories.push(current);
+    }
+  }
+  return directories;
+}
+
+function addDirectoryChain(directorySet, rootDirectory, leafDirectory) {
+  for (const directory of directoryChain(rootDirectory, leafDirectory)) {
+    directorySet.add(directory);
+  }
+}
+
+function syncDirectoryChain(rootDirectory, leafDirectory) {
+  for (const directory of directoryChain(
+    rootDirectory,
+    leafDirectory,
+  ).reverse()) {
+    syncDirectory(directory);
+  }
+}
+
 function lstatIfExists(path) {
   try {
     return lstatSync(path);
@@ -91,6 +222,88 @@ function lstatIfExists(path) {
       return null;
     }
     throw error;
+  }
+}
+
+function isProcessAlive(processId) {
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    return false;
+  }
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "EPERM") {
+      return true;
+    }
+    if (error.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function assertJournalIsNotActive(journalPath, ownerProcessId) {
+  if (
+    ACTIVE_OWNERSHIP_JOURNALS.has(journalPath) ||
+    (ownerProcessId !== process.pid && isProcessAlive(ownerProcessId))
+  ) {
+    throw new Error(
+      `Refusing to install: another installation is in progress: ${journalPath}`,
+    );
+  }
+}
+
+function directoryIdentity(stat) {
+  return { device: stat.dev, inode: stat.ino };
+}
+
+function serializedDirectoryIdentity(identity) {
+  return {
+    device: String(identity.device),
+    inode: String(identity.inode),
+  };
+}
+
+function assertDirectoryIdentity(directory, expectedIdentity, description) {
+  const stat = lstatIfExists(directory);
+  if (
+    stat === null ||
+    stat.isSymbolicLink() ||
+    !stat.isDirectory() ||
+    stat.dev !== expectedIdentity.device ||
+    stat.ino !== expectedIdentity.inode
+  ) {
+    throw new Error(
+      `Refusing to install: ${description} changed after preflight: ${directory}`,
+    );
+  }
+}
+
+function assertSerializedDirectoryIdentity(
+  directory,
+  expectedIdentity,
+  description,
+) {
+  const stat = lstatIfExists(directory);
+  if (
+    stat === null ||
+    stat.isSymbolicLink() ||
+    !stat.isDirectory() ||
+    String(stat.dev) !== expectedIdentity.device ||
+    String(stat.ino) !== expectedIdentity.inode
+  ) {
+    throw new Error(
+      `Refusing to install: ${description} changed during an interrupted swap: ${directory}`,
+    );
+  }
+}
+
+function assertPathStillMissing(path, description) {
+  if (lstatIfExists(path) !== null) {
+    throw new Error(
+      `Refusing to install: ${description} changed after preflight: ${path}`,
+    );
   }
 }
 
@@ -140,43 +353,101 @@ function serializeManifest(manifest) {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
-function buildManifest({ skill, skillVersion, source, harnesses, files }) {
-  return {
+function normalizedManifestFiles(files) {
+  return [...files]
+    .map(({ path, sha256: hash }) => ({ path, sha256: hash }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function buildManifest({
+  skill,
+  skillVersion,
+  source,
+  harnesses,
+  files,
+  state = MANIFEST_STATE_COMPLETE,
+  previousManifestSha256,
+}) {
+  const manifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
+    transactionVersion: TRANSACTION_VERSION,
+    state,
     installer: INSTALLER_ID,
     skill,
     skillVersion,
     source,
     harnesses: [...harnesses],
-    files: [...files]
-      .map(({ path, sha256: hash }) => ({ path, sha256: hash }))
-      .sort((a, b) => a.path.localeCompare(b.path)),
+    files: normalizedManifestFiles(files),
   };
+  if (state === MANIFEST_STATE_INSTALLING) {
+    manifest.previousManifestSha256 = previousManifestSha256 ?? null;
+    manifest.ownerProcessId = process.pid;
+  }
+  return manifest;
 }
 
-function assertValidManifestShape(manifest, manifestPath) {
-  const valid =
-    manifest !== null &&
-    typeof manifest === "object" &&
-    !Array.isArray(manifest) &&
-    manifest.schemaVersion === MANIFEST_SCHEMA_VERSION &&
-    manifest.installer === INSTALLER_ID &&
-    typeof manifest.skill === "string" &&
-    typeof manifest.skillVersion === "string" &&
-    typeof manifest.source === "string" &&
-    Array.isArray(manifest.harnesses) &&
-    manifest.harnesses.every((harness) => typeof harness === "string") &&
-    Array.isArray(manifest.files) &&
-    manifest.files.every(
+function isValidManifestFileList(files) {
+  return (
+    Array.isArray(files) &&
+    files.every(
       (file) =>
         file !== null &&
         typeof file === "object" &&
         typeof file.path === "string" &&
         typeof file.sha256 === "string" &&
         /^[0-9a-f]{64}$/.test(file.sha256),
-    );
+    )
+  );
+}
 
-  if (!valid) {
+function manifestState(manifest) {
+  return manifest.schemaVersion === LEGACY_MANIFEST_SCHEMA_VERSION
+    ? MANIFEST_STATE_COMPLETE
+    : manifest.state;
+}
+
+function assertValidManifestShape(manifest, manifestPath) {
+  const baseValid =
+    manifest !== null &&
+    typeof manifest === "object" &&
+    !Array.isArray(manifest) &&
+    manifest.installer === INSTALLER_ID &&
+    typeof manifest.skill === "string" &&
+    typeof manifest.skillVersion === "string" &&
+    typeof manifest.source === "string" &&
+    Array.isArray(manifest.harnesses) &&
+    manifest.harnesses.every((harness) => typeof harness === "string") &&
+    isValidManifestFileList(manifest.files);
+
+  if (!baseValid) {
+    throw new Error(`Invalid ownership manifest: ${manifestPath}`);
+  }
+
+  const validLegacyManifest =
+    manifest.schemaVersion === LEGACY_MANIFEST_SCHEMA_VERSION &&
+    manifest.transactionVersion === undefined &&
+    manifest.state === undefined &&
+    manifest.previousManifestSha256 === undefined &&
+    manifest.ownerProcessId === undefined &&
+    manifest.previousFiles === undefined;
+
+  const validCurrentManifest =
+    manifest.schemaVersion === MANIFEST_SCHEMA_VERSION &&
+    manifest.transactionVersion === TRANSACTION_VERSION &&
+    (manifest.state === MANIFEST_STATE_COMPLETE ||
+      manifest.state === MANIFEST_STATE_INSTALLING) &&
+    (manifest.state === MANIFEST_STATE_INSTALLING
+      ? (manifest.previousManifestSha256 === null ||
+          (typeof manifest.previousManifestSha256 === "string" &&
+            /^[0-9a-f]{64}$/.test(manifest.previousManifestSha256))) &&
+        Number.isSafeInteger(manifest.ownerProcessId) &&
+        manifest.ownerProcessId > 0 &&
+        manifest.previousFiles === undefined
+      : manifest.previousManifestSha256 === undefined &&
+        manifest.ownerProcessId === undefined &&
+        manifest.previousFiles === undefined);
+
+  if (!validLegacyManifest && !validCurrentManifest) {
     throw new Error(`Invalid ownership manifest: ${manifestPath}`);
   }
 }
@@ -240,10 +511,11 @@ function assertManifestOwnership(
       `Refusing to install: ownership manifest has duplicate file paths: ${manifestPath}`,
     );
   }
+
 }
 
-function readManifestIfExists(directory) {
-  const manifestPath = join(directory, MANIFEST_FILENAME);
+function readManifestFileIfExists(directory, filename) {
+  const manifestPath = join(directory, filename);
   const stat = lstatIfExists(manifestPath);
   if (stat === null) {
     return { exists: false };
@@ -255,22 +527,100 @@ function readManifestIfExists(directory) {
   }
 
   let manifest;
+  let content;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    content = readFileSync(manifestPath);
+    manifest = JSON.parse(content.toString("utf8"));
   } catch (error) {
     throw new Error(
       `Refusing to install: unable to parse ownership manifest: ${manifestPath}`,
     );
   }
   assertValidManifestShape(manifest, manifestPath);
-  return { exists: true, manifest, manifestPath };
+  return {
+    exists: true,
+    manifest,
+    manifestPath,
+    contentHash: sha256(content),
+  };
 }
 
-// Walks an *existing destination* directory tree, rejecting symlinks and any
-// non-regular entries before mutation (item 12). The top-level manifest file
-// is metadata, not tracked payload, and is excluded from the result.
-function walkExistingDestinationFiles(rootDir) {
+function readManifestIfExists(directory) {
+  return readManifestFileIfExists(directory, MANIFEST_FILENAME);
+}
+
+function readTransactionIfExists(directory) {
+  return readManifestFileIfExists(directory, TRANSACTION_FILENAME);
+}
+
+function assertManifestHash(directory, filename, expectedHash) {
+  const result = readManifestFileIfExists(directory, filename);
+  const actualHash = result.exists ? result.contentHash : null;
+  if (actualHash !== expectedHash) {
+    throw new Error(
+      `Refusing to install: ownership metadata changed after preflight: ${join(directory, filename)}`,
+    );
+  }
+}
+
+function assertAgentFileState(targetDir, harness, filename, expectedHash) {
+  const filePath = resolveSafeAgentFilePath(
+    targetDir,
+    harness,
+    filename,
+    "agent destination",
+  );
+  const stat = lstatIfExists(filePath);
+  if (expectedHash === null) {
+    if (stat !== null) {
+      throw new Error(
+        `Refusing to install: agent destination changed after preflight: ${filePath}`,
+      );
+    }
+    return;
+  }
+  if (stat === null || stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(
+      `Refusing to install: agent destination changed after preflight: ${filePath}`,
+    );
+  }
+  if (sha256(readFileSync(filePath)) !== expectedHash) {
+    throw new Error(
+      `Refusing to install: agent file drifted after preflight: ${filePath}`,
+    );
+  }
+}
+
+function assertAgentFileStates(targetDir, harness, expectedFileStates) {
+  for (const [filename, expectedHash] of expectedFileStates) {
+    assertAgentFileState(targetDir, harness, filename, expectedHash);
+  }
+}
+
+function expectedDestinationDirectories(files) {
+  const directories = new Set();
+  for (const file of files) {
+    const segments = file.path.split("/");
+    segments.pop();
+    let current = "";
+    for (const segment of segments) {
+      current = current === "" ? segment : `${current}/${segment}`;
+      directories.add(current);
+    }
+  }
+  return directories;
+}
+
+// Walks an *existing destination* directory tree, rejecting symlinks,
+// non-regular entries, and directories that are not required ancestors of a
+// manifest-owned file. The top-level manifest file is metadata, not tracked
+// payload, and is excluded from the result.
+function walkExistingDestinationFiles(rootDir, expectedFiles) {
   const files = [];
+  const expectedDirectories =
+    expectedFiles === undefined
+      ? null
+      : expectedDestinationDirectories(expectedFiles);
 
   function walk(currentDir, relativeDir) {
     for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
@@ -287,6 +637,15 @@ function walkExistingDestinationFiles(rootDir) {
         );
       }
       if (entry.isDirectory()) {
+        const posixRelativePath = toPosixPath(relativePath);
+        if (
+          expectedDirectories !== null &&
+          !expectedDirectories.has(posixRelativePath)
+        ) {
+          throw new Error(
+            `Refusing to install: existing destination contains an untracked directory: ${entryPath}`,
+          );
+        }
         walk(entryPath, relativePath);
         continue;
       }
@@ -505,6 +864,11 @@ function readSourceSkillTree(skillDir, realSkillDir) {
       const relativePath =
         relativeDir === "" ? entry.name : `${relativeDir}/${entry.name}`;
 
+      if (!isSafeRelativePath(relativePath)) {
+        throw new Error(
+          `Skill source contains an unsafe path: ${relativePath}`,
+        );
+      }
       if (relativeDir === "" && entry.name === MANIFEST_FILENAME) {
         throw new Error(
           `Skill source contains a reserved filename: ${relativePath}`,
@@ -690,6 +1054,803 @@ function mergedHarnesses(existingHarnesses, selectedHarnesses, allowedHarnesses)
   return allowedHarnesses.filter((harness) => merged.has(harness));
 }
 
+function agentManifestFiles(files) {
+  return normalizedManifestFiles(
+    files.map((file) => ({
+      path: file.filename,
+      sha256: sha256(file.content),
+    })),
+  );
+}
+
+function readVerifiedInstalledSkillFile(
+  directory,
+  manifestFiles,
+  relativePath,
+) {
+  const expectedFile = manifestFiles.find(
+    (file) => file.path === relativePath,
+  );
+  if (expectedFile === undefined || !isSafeRelativePath(relativePath)) {
+    throw new Error(
+      `Refusing to install: installed skill is missing required source: ${relativePath}`,
+    );
+  }
+  const filePath = resolve(directory, relativePath);
+  if (!isContainedPath(directory, filePath)) {
+    throw new Error(
+      `Refusing to install: installed skill source escapes its directory: ${relativePath}`,
+    );
+  }
+  const stat = lstatIfExists(filePath);
+  if (stat === null || stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(
+      `Refusing to install: installed skill source must be a regular file: ${filePath}`,
+    );
+  }
+  const content = readFileSync(filePath);
+  if (sha256(content) !== expectedFile.sha256) {
+    throw new Error(
+      `Refusing to install: installed skill source changed during preflight: ${filePath}`,
+    );
+  }
+  return content;
+}
+
+function deriveInstalledSkillAgentPayloads({
+  directory,
+  manifest,
+  harnesses,
+}) {
+  if (manifest.skill !== DEFAULT_SKILL) {
+    return {};
+  }
+
+  const configPath = "config/reviewers.yaml";
+  let config;
+  try {
+    config = YAML.parse(
+      readVerifiedInstalledSkillFile(
+        directory,
+        manifest.files,
+        configPath,
+      ).toString("utf8"),
+    );
+    assertValidConfig(config);
+  } catch (error) {
+    throw new Error(
+      `Refusing to install: installed skill reviewer configuration is invalid: ${join(directory, configPath)}`,
+      { cause: error },
+    );
+  }
+
+  const prompts = {};
+  for (const reviewer of config.reviewers) {
+    prompts[reviewer.prompt] = readVerifiedInstalledSkillFile(
+      directory,
+      manifest.files,
+      reviewer.prompt,
+    ).toString("utf8");
+  }
+
+  const rendered = renderAgents(config, prompts);
+  return Object.fromEntries(
+    harnesses.map((harness) => {
+      const files = Object.entries(rendered[harness]).map(
+        ([filename, content]) => {
+          resolveSafeAgentFilePath(
+            directory,
+            harness,
+            filename,
+            "installed skill generated agent",
+          );
+          return {
+            filename,
+            content: Buffer.from(content, "utf8"),
+          };
+        },
+      );
+      return [harness, files];
+    }),
+  );
+}
+
+function deriveInstalledSkillAgentFiles(options) {
+  const payloads = deriveInstalledSkillAgentPayloads(options);
+  return Object.fromEntries(
+    Object.entries(payloads).map(([harness, files]) => [
+      harness,
+      agentManifestFiles(files),
+    ]),
+  );
+}
+
+function sameManifestFiles(left, right) {
+  return (
+    JSON.stringify(normalizedManifestFiles(left)) ===
+    JSON.stringify(normalizedManifestFiles(right))
+  );
+}
+
+function skillSwapJournalPath(targetDir) {
+  return join(
+    dirname(targetDir),
+    `.${basename(targetDir)}.knights-swap.json`,
+  );
+}
+
+function readSkillSwapJournalIfExists(
+  targetDir,
+  journalPath = skillSwapJournalPath(targetDir),
+) {
+  const stat = lstatIfExists(journalPath);
+  if (stat === null) {
+    return { exists: false, journalPath };
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(
+      `Refusing to install: skill swap journal must be a regular file: ${journalPath}`,
+    );
+  }
+
+  let journal;
+  let content;
+  try {
+    content = readFileSync(journalPath);
+    journal = JSON.parse(content.toString("utf8"));
+  } catch {
+    throw new Error(
+      `Refusing to install: unable to parse skill swap journal: ${journalPath}`,
+    );
+  }
+
+  const targetName = basename(targetDir);
+  const stagePrefix = `.${targetName}.knights-stage-`;
+  const validIdentity = (identity) =>
+    identity !== null &&
+    typeof identity === "object" &&
+    !Array.isArray(identity) &&
+    typeof identity.device === "string" &&
+    /^\d+$/.test(identity.device) &&
+    typeof identity.inode === "string" &&
+    /^\d+$/.test(identity.inode);
+  const valid =
+    journal !== null &&
+    typeof journal === "object" &&
+    !Array.isArray(journal) &&
+    journal.schemaVersion === SKILL_SWAP_JOURNAL_SCHEMA_VERSION &&
+    journal.installer === INSTALLER_ID &&
+    journal.state === SKILL_SWAP_JOURNAL_STATE_PREPARED &&
+    Number.isSafeInteger(journal.ownerProcessId) &&
+    journal.ownerProcessId > 0 &&
+    journal.targetName === targetName &&
+    typeof journal.stageName === "string" &&
+    journal.stageName.startsWith(stagePrefix) &&
+    !journal.stageName.includes("/") &&
+    validIdentity(journal.stageIdentity) &&
+    validIdentity(journal.priorIdentity) &&
+    isValidManifestFileList(journal.stagedFiles) &&
+    new Set(journal.stagedFiles.map((file) => file.path)).size ===
+      journal.stagedFiles.length &&
+    isValidManifestFileList(journal.priorFiles) &&
+    new Set(journal.priorFiles.map((file) => file.path)).size ===
+      journal.priorFiles.length &&
+    typeof journal.stagedManifestSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(journal.stagedManifestSha256) &&
+    typeof journal.priorManifestSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(journal.priorManifestSha256);
+  if (!valid) {
+    throw new Error(`Invalid skill swap journal: ${journalPath}`);
+  }
+  const parentDir = dirname(targetDir);
+  const stageDir = resolve(parentDir, journal.stageName);
+  if (dirname(stageDir) !== parentDir) {
+    throw new Error(`Invalid skill swap journal: ${journalPath}`);
+  }
+
+  return {
+    exists: true,
+    journal,
+    journalPath,
+    stageDir,
+    contentHash: sha256(content),
+    identity: directoryIdentity(stat),
+  };
+}
+
+function skillSwapRecoveryPrefix(targetDir) {
+  return `.${basename(targetDir)}.knights-swap.recovering-`;
+}
+
+function recoveryOwnerProcessId(filename, prefix) {
+  if (!filename.startsWith(prefix) || !filename.endsWith(".json")) {
+    return null;
+  }
+  const suffix = filename.slice(prefix.length, -".json".length);
+  const separatorIndex = suffix.indexOf("-");
+  const processIdText =
+    separatorIndex === -1 ? suffix : suffix.slice(0, separatorIndex);
+  const processId = Number(processIdText);
+  return Number.isSafeInteger(processId) && processId > 0
+    ? processId
+    : null;
+}
+
+function claimSkillSwapJournalForRecovery(targetDir) {
+  const parentDir = dirname(targetDir);
+  const fixedJournalPath = skillSwapJournalPath(targetDir);
+  const parentStat = lstatIfExists(parentDir);
+  if (parentStat === null) {
+    return { exists: false, journalPath: fixedJournalPath };
+  }
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error(
+      `Refusing to install: skill swap parent is unsafe: ${parentDir}`,
+    );
+  }
+  const recoveryPrefix = skillSwapRecoveryPrefix(targetDir);
+  const recoveryNames = readdirSync(parentDir)
+    .filter((name) => name.startsWith(recoveryPrefix))
+    .sort();
+
+  if (lstatIfExists(fixedJournalPath) !== null && recoveryNames.length > 0) {
+    throw new Error(
+      `Refusing to install: multiple skill swap journals exist for ${targetDir}`,
+    );
+  }
+  if (recoveryNames.length > 1) {
+    throw new Error(
+      `Refusing to install: multiple skill swap recovery claims exist for ${targetDir}`,
+    );
+  }
+
+  let sourceJournalPath = fixedJournalPath;
+  let recoveryOwner = null;
+  if (recoveryNames.length === 1) {
+    sourceJournalPath = join(parentDir, recoveryNames[0]);
+    recoveryOwner = recoveryOwnerProcessId(
+      recoveryNames[0],
+      recoveryPrefix,
+    );
+    if (recoveryOwner === null) {
+      throw new Error(
+        `Invalid skill swap recovery claim: ${sourceJournalPath}`,
+      );
+    }
+  }
+
+  const journalResult = readSkillSwapJournalIfExists(
+    targetDir,
+    sourceJournalPath,
+  );
+  if (!journalResult.exists) {
+    return journalResult;
+  }
+  if (recoveryOwner !== null) {
+    assertJournalIsNotActive(sourceJournalPath, recoveryOwner);
+  } else {
+    assertJournalIsNotActive(
+      sourceJournalPath,
+      journalResult.journal.ownerProcessId,
+    );
+  }
+
+  const claimedPath = join(
+    parentDir,
+    `${recoveryPrefix}${process.pid}-${randomUUID()}.json`,
+  );
+  renameSync(sourceJournalPath, claimedPath);
+  syncDirectory(parentDir);
+  const claimedResult = readSkillSwapJournalIfExists(
+    targetDir,
+    claimedPath,
+  );
+  if (
+    !claimedResult.exists ||
+    claimedResult.contentHash !== journalResult.contentHash ||
+    claimedResult.identity.device !== journalResult.identity.device ||
+    claimedResult.identity.inode !== journalResult.identity.inode
+  ) {
+    throw new Error(
+      `Refusing to install: skill swap recovery claim changed while acquiring it: ${claimedPath}`,
+    );
+  }
+  ACTIVE_OWNERSHIP_JOURNALS.add(claimedPath);
+  return claimedResult;
+}
+
+function findSkillSwapBackupDirectory(targetDir, priorIdentity) {
+  const parentDir = dirname(targetDir);
+  const prefix = `.${basename(targetDir)}.knights-backup-`;
+  const matches = [];
+  for (const entry of readdirSync(parentDir, { withFileTypes: true })) {
+    if (!entry.name.startsWith(prefix)) {
+      continue;
+    }
+    const entryPath = join(parentDir, entry.name);
+    const stat = lstatIfExists(entryPath);
+    if (
+      stat !== null &&
+      !stat.isSymbolicLink() &&
+      stat.isDirectory() &&
+      String(stat.dev) === priorIdentity.device &&
+      String(stat.ino) === priorIdentity.inode
+    ) {
+      matches.push(entryPath);
+    }
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `Refusing to install: multiple skill swap backups match ${targetDir}`,
+    );
+  }
+  return matches[0] ?? null;
+}
+
+function assertCompleteSkillDirectory({
+  directory,
+  expectedManifestHash,
+  skill,
+  allowedHarnesses,
+  description,
+}) {
+  const stat = lstatIfExists(directory);
+  if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(
+      `Refusing to install: ${description} is not a safe directory: ${directory}`,
+    );
+  }
+  const manifestResult = readManifestIfExists(directory);
+  if (
+    !manifestResult.exists ||
+    manifestResult.contentHash !== expectedManifestHash
+  ) {
+    throw new Error(
+      `Refusing to install: ${description} manifest does not match the swap journal: ${directory}`,
+    );
+  }
+  assertManifestOwnership(manifestResult.manifest, manifestResult.manifestPath, {
+    skill,
+    allowedHarnesses,
+  });
+  if (manifestState(manifestResult.manifest) !== MANIFEST_STATE_COMPLETE) {
+    throw new Error(
+      `Refusing to install: ${description} manifest is not complete: ${directory}`,
+    );
+  }
+  const actualFiles = walkExistingDestinationFiles(
+    directory,
+    manifestResult.manifest.files,
+  );
+  const expectedFiles = manifestResult.manifest.files
+    .map((file) => file.path)
+    .sort();
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    throw new Error(
+      `Refusing to install: ${description} files do not match its manifest: ${directory}`,
+    );
+  }
+  assertManifestFilesUncorrupted(directory, manifestResult.manifest.files);
+}
+
+function assertSkillPayloadSnapshot({
+  directory,
+  expectedIdentity,
+  expectedFiles,
+  description,
+}) {
+  assertDirectoryIdentity(directory, expectedIdentity, description);
+  assertPathStillMissing(
+    join(directory, MANIFEST_FILENAME),
+    `${description} manifest`,
+  );
+  const actualFiles = walkExistingDestinationFiles(directory, expectedFiles);
+  const expectedPaths = expectedFiles.map((file) => file.path).sort();
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedPaths)) {
+    throw new Error(
+      `Refusing to install: ${description} files changed before manifest creation: ${directory}`,
+    );
+  }
+  assertManifestFilesUncorrupted(directory, expectedFiles);
+}
+
+function validatePartiallyRemovedSkillDirectory({
+  directory,
+  expectedIdentity,
+  expectedManifestHash,
+  expectedFiles,
+  skill,
+  allowedHarnesses,
+  description,
+}) {
+  assertSerializedDirectoryIdentity(
+    directory,
+    expectedIdentity,
+    description,
+  );
+
+  const manifestResult = readManifestIfExists(directory);
+  if (!manifestResult.exists) {
+    if (readdirSync(directory).length > 0) {
+      throw new Error(
+        `Refusing to install: ${description} ownership manifest is missing while payload remains: ${directory}`,
+      );
+    }
+    return manifestResult;
+  }
+  if (manifestResult.contentHash !== expectedManifestHash) {
+    throw new Error(
+      `Refusing to install: ${description} manifest changed during cleanup: ${manifestResult.manifestPath}`,
+    );
+  }
+  assertManifestOwnership(
+    manifestResult.manifest,
+    manifestResult.manifestPath,
+    { skill, allowedHarnesses },
+  );
+  if (
+    manifestState(manifestResult.manifest) !== MANIFEST_STATE_COMPLETE ||
+    !sameManifestFiles(manifestResult.manifest.files, expectedFiles)
+  ) {
+    throw new Error(
+      `Refusing to install: ${description} manifest does not match the swap journal: ${manifestResult.manifestPath}`,
+    );
+  }
+
+  const expectedHashes = new Map(
+    manifestResult.manifest.files.map((file) => [file.path, file.sha256]),
+  );
+  for (const relativePath of walkExistingDestinationFiles(
+    directory,
+    manifestResult.manifest.files,
+  )) {
+    const expectedHash = expectedHashes.get(relativePath);
+    const filePath = resolve(directory, relativePath);
+    if (
+      expectedHash === undefined ||
+      !isSafeRelativePath(relativePath) ||
+      !isContainedPath(directory, filePath) ||
+      sha256(readFileSync(filePath)) !== expectedHash
+    ) {
+      throw new Error(
+        `Refusing to install: ${description} contains changed or untracked files: ${directory}`,
+      );
+    }
+  }
+  return manifestResult;
+}
+
+function removeOwnedSkillDirectoryIncrementally({
+  directory,
+  expectedIdentity,
+  expectedManifestHash,
+  expectedFiles,
+  skill,
+  allowedHarnesses,
+  description,
+  beforeManifestRemoval = () => {},
+}) {
+  const manifestResult = validatePartiallyRemovedSkillDirectory({
+    directory,
+    expectedIdentity,
+    expectedManifestHash,
+    expectedFiles,
+    skill,
+    allowedHarnesses,
+    description,
+  });
+
+  if (!manifestResult.exists) {
+    rmdirSync(directory);
+    syncDirectory(dirname(directory));
+    return;
+  }
+
+  for (const file of manifestResult.manifest.files) {
+    const filePath = resolve(directory, file.path);
+    assertSerializedDirectoryIdentity(
+      directory,
+      expectedIdentity,
+      description,
+    );
+    assertSafeAncestors(directory, filePath, description);
+    const stat = lstatIfExists(filePath);
+    if (stat === null) {
+      continue;
+    }
+    if (
+      stat.isSymbolicLink() ||
+      !stat.isFile() ||
+      sha256(readFileSync(filePath)) !== file.sha256
+    ) {
+      throw new Error(
+        `Refusing to install: ${description} file changed during cleanup: ${filePath}`,
+      );
+    }
+    rmSync(filePath);
+    syncDirectory(dirname(filePath));
+  }
+
+  const ownedDirectories = [...expectedDestinationDirectories(
+    manifestResult.manifest.files,
+  )].sort((left, right) => {
+    const depthDifference =
+      right.split("/").length - left.split("/").length;
+    return depthDifference === 0
+      ? right.localeCompare(left)
+      : depthDifference;
+  });
+  for (const relativePath of ownedDirectories) {
+    const directoryPath = resolve(directory, relativePath);
+    assertSerializedDirectoryIdentity(
+      directory,
+      expectedIdentity,
+      description,
+    );
+    const stat = lstatIfExists(directoryPath);
+    if (stat === null) {
+      continue;
+    }
+    if (
+      stat.isSymbolicLink() ||
+      !stat.isDirectory() ||
+      readdirSync(directoryPath).length > 0
+    ) {
+      throw new Error(
+        `Refusing to install: ${description} directory changed during cleanup: ${directoryPath}`,
+      );
+    }
+    rmdirSync(directoryPath);
+    syncDirectory(dirname(directoryPath));
+  }
+
+  validatePartiallyRemovedSkillDirectory({
+    directory,
+    expectedIdentity,
+    expectedManifestHash,
+    expectedFiles,
+    skill,
+    allowedHarnesses,
+    description,
+  });
+  beforeManifestRemoval();
+  validatePartiallyRemovedSkillDirectory({
+    directory,
+    expectedIdentity,
+    expectedManifestHash,
+    expectedFiles,
+    skill,
+    allowedHarnesses,
+    description,
+  });
+  rmSync(manifestResult.manifestPath);
+  syncDirectory(directory);
+  assertSerializedDirectoryIdentity(
+    directory,
+    expectedIdentity,
+    description,
+  );
+  if (readdirSync(directory).length > 0) {
+    throw new Error(
+      `Refusing to install: ${description} changed after manifest cleanup: ${directory}`,
+    );
+  }
+  rmdirSync(directory);
+  syncDirectory(dirname(directory));
+}
+
+function recoverInterruptedSkillSwap({
+  resolvedHome,
+  targetDir,
+  skill,
+  allowedHarnesses,
+  onInstallEvent,
+}) {
+  assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+  const parentDir = dirname(targetDir);
+  const initialParentStat = lstatIfExists(parentDir);
+  if (initialParentStat === null) {
+    return;
+  }
+  if (
+    initialParentStat.isSymbolicLink() ||
+    !initialParentStat.isDirectory()
+  ) {
+    throw new Error(
+      `Refusing to install: skill swap parent is unsafe: ${parentDir}`,
+    );
+  }
+  const parentIdentity = directoryIdentity(initialParentStat);
+  const journalResult = claimSkillSwapJournalForRecovery(targetDir);
+  if (!journalResult.exists) {
+    return;
+  }
+
+  const {
+    journal,
+    journalPath,
+    stageDir,
+    contentHash: journalHash,
+    identity: journalIdentity,
+  } = journalResult;
+  const assertRecoveryContext = () => {
+    assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+    assertDirectoryIdentity(
+      parentDir,
+      parentIdentity,
+      "skill swap parent",
+    );
+    const currentJournal = readSkillSwapJournalIfExists(
+      targetDir,
+      journalPath,
+    );
+    if (
+      !currentJournal.exists ||
+      currentJournal.contentHash !== journalHash ||
+      currentJournal.identity.device !== journalIdentity.device ||
+      currentJournal.identity.inode !== journalIdentity.inode
+    ) {
+      throw new Error(
+        `Refusing to install: skill swap recovery journal changed: ${journalPath}`,
+      );
+    }
+  };
+
+  try {
+    onInstallEvent({ phase: "after-skill-recovery-claim", targetDir });
+    assertRecoveryContext();
+
+    const targetStat = lstatIfExists(targetDir);
+    const stageStat = lstatIfExists(stageDir);
+    const backupDir = findSkillSwapBackupDirectory(
+      targetDir,
+      journal.priorIdentity,
+    );
+    const backupStat =
+      backupDir === null ? null : lstatIfExists(backupDir);
+
+    if (targetStat === null && backupStat !== null) {
+      assertCompleteSkillDirectory({
+        directory: backupDir,
+        expectedManifestHash: journal.priorManifestSha256,
+        skill,
+        allowedHarnesses,
+        description: "skill swap backup",
+      });
+      if (stageStat !== null) {
+        validatePartiallyRemovedSkillDirectory({
+          directory: stageDir,
+          expectedIdentity: journal.stageIdentity,
+          expectedManifestHash: journal.stagedManifestSha256,
+          expectedFiles: journal.stagedFiles,
+          skill,
+          allowedHarnesses,
+          description: "skill swap stage",
+        });
+      }
+      assertRecoveryContext();
+      renameSync(backupDir, targetDir);
+      syncDirectory(parentDir);
+      assertCompleteSkillDirectory({
+        directory: targetDir,
+        expectedManifestHash: journal.priorManifestSha256,
+        skill,
+        allowedHarnesses,
+        description: "restored skill",
+      });
+      if (stageStat !== null) {
+        removeOwnedSkillDirectoryIncrementally({
+          directory: stageDir,
+          expectedIdentity: journal.stageIdentity,
+          expectedManifestHash: journal.stagedManifestSha256,
+          expectedFiles: journal.stagedFiles,
+          skill,
+          allowedHarnesses,
+          description: "skill swap stage",
+        });
+      }
+      assertRecoveryContext();
+      rmSync(journalPath, { force: true });
+      syncDirectory(parentDir);
+      return;
+    }
+
+    if (
+      targetStat !== null &&
+      !targetStat.isSymbolicLink() &&
+      targetStat.isDirectory()
+    ) {
+      if (
+        String(targetStat.dev) === journal.stageIdentity.device &&
+        String(targetStat.ino) === journal.stageIdentity.inode
+      ) {
+        assertCompleteSkillDirectory({
+          directory: targetDir,
+          expectedManifestHash: journal.stagedManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "published skill",
+        });
+        if (stageStat !== null) {
+          throw new Error(
+            `Refusing to install: interrupted skill swap has duplicate stage paths: ${journalPath}`,
+          );
+        }
+        if (backupStat !== null) {
+          validatePartiallyRemovedSkillDirectory({
+            directory: backupDir,
+            expectedIdentity: journal.priorIdentity,
+            expectedManifestHash: journal.priorManifestSha256,
+            expectedFiles: journal.priorFiles,
+            skill,
+            allowedHarnesses,
+            description: "skill swap backup",
+          });
+          assertRecoveryContext();
+          removeOwnedSkillDirectoryIncrementally({
+            directory: backupDir,
+            expectedIdentity: journal.priorIdentity,
+            expectedManifestHash: journal.priorManifestSha256,
+            expectedFiles: journal.priorFiles,
+            skill,
+            allowedHarnesses,
+            description: "skill swap backup",
+          });
+        }
+        assertRecoveryContext();
+        rmSync(journalPath, { force: true });
+        syncDirectory(parentDir);
+        return;
+      }
+
+      if (
+        backupStat === null &&
+        String(targetStat.dev) === journal.priorIdentity.device &&
+        String(targetStat.ino) === journal.priorIdentity.inode
+      ) {
+        assertCompleteSkillDirectory({
+          directory: targetDir,
+          expectedManifestHash: journal.priorManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "prior skill",
+        });
+        if (stageStat !== null) {
+          validatePartiallyRemovedSkillDirectory({
+            directory: stageDir,
+            expectedIdentity: journal.stageIdentity,
+            expectedManifestHash: journal.stagedManifestSha256,
+            expectedFiles: journal.stagedFiles,
+            skill,
+            allowedHarnesses,
+            description: "skill swap stage",
+          });
+          assertRecoveryContext();
+          removeOwnedSkillDirectoryIncrementally({
+            directory: stageDir,
+            expectedIdentity: journal.stageIdentity,
+            expectedManifestHash: journal.stagedManifestSha256,
+            expectedFiles: journal.stagedFiles,
+            skill,
+            allowedHarnesses,
+            description: "skill swap stage",
+          });
+        }
+        assertRecoveryContext();
+        rmSync(journalPath, { force: true });
+        syncDirectory(parentDir);
+        return;
+      }
+    }
+
+    throw new Error(
+      `Refusing to install: unable to recover interrupted skill swap: ${journalPath}`,
+    );
+  } finally {
+    ACTIVE_OWNERSHIP_JOURNALS.delete(journalPath);
+  }
+}
+
 // Determines whether an existing skill install directory may be replaced.
 // Throws (refusing to mutate anything) unless the directory is missing, or
 // it is fully owned by a valid prior manifest, every listed file's hash
@@ -697,7 +1858,14 @@ function mergedHarnesses(existingHarnesses, selectedHarnesses, allowedHarnesses)
 function preflightSkillGroup({ targetDir, skill, allowedHarnesses, force }) {
   const stat = lstatIfExists(targetDir);
   if (stat === null) {
-    return { existed: false, priorHarnesses: [] };
+    return {
+      existed: false,
+      expectedFiles: [],
+      expectedManifestHash: null,
+      priorHarnesses: [],
+      priorManifest: null,
+      targetIdentity: null,
+    };
   }
   if (stat.isSymbolicLink()) {
     throw new Error(
@@ -720,8 +1888,16 @@ function preflightSkillGroup({ targetDir, skill, allowedHarnesses, force }) {
     skill,
     allowedHarnesses,
   });
+  if (manifestState(manifestResult.manifest) !== MANIFEST_STATE_COMPLETE) {
+    throw new Error(
+      `Refusing to install: skill ownership manifest is not complete: ${manifestResult.manifestPath}`,
+    );
+  }
 
-  const actualFiles = walkExistingDestinationFiles(targetDir);
+  const actualFiles = walkExistingDestinationFiles(
+    targetDir,
+    manifestResult.manifest.files,
+  );
   const manifestFiles = manifestResult.manifest.files
     .map((file) => file.path)
     .sort();
@@ -731,14 +1907,44 @@ function preflightSkillGroup({ targetDir, skill, allowedHarnesses, force }) {
     );
   }
   assertManifestFilesUncorrupted(targetDir, manifestResult.manifest.files);
-
   if (!force) {
     throw new Error(
       `Refusing to install: already installed at ${targetDir} (pass --force to update)`,
     );
   }
 
-  return { existed: true, priorHarnesses: manifestResult.manifest.harnesses };
+  return {
+    existed: true,
+    expectedFiles: manifestResult.manifest.files,
+    expectedManifestHash: manifestResult.contentHash,
+    priorHarnesses: manifestResult.manifest.harnesses,
+    priorManifest: manifestResult.manifest,
+    targetIdentity: directoryIdentity(stat),
+  };
+}
+
+function assertSkillDestinationUnchanged({
+  targetDir,
+  existed,
+  expectedFiles,
+  expectedManifestHash,
+  targetIdentity,
+}) {
+  if (!existed) {
+    assertPathStillMissing(targetDir, "skill destination");
+    return;
+  }
+
+  assertDirectoryIdentity(targetDir, targetIdentity, "skill destination");
+  assertManifestHash(targetDir, MANIFEST_FILENAME, expectedManifestHash);
+  const actualFiles = walkExistingDestinationFiles(targetDir, expectedFiles);
+  const expectedPaths = expectedFiles.map((file) => file.path).sort();
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedPaths)) {
+    throw new Error(
+      `Refusing to install: skill destination changed after preflight: ${targetDir}`,
+    );
+  }
+  assertManifestFilesUncorrupted(targetDir, expectedFiles);
 }
 
 // Per-file ownership check for a shared agent directory (item 8, 9, 10):
@@ -751,7 +1957,14 @@ function preflightSkillGroup({ targetDir, skill, allowedHarnesses, force }) {
 // owned agent cleanup). A stale file is only ever scheduled for deletion
 // once it has been confirmed to still match the hash recorded for it in the
 // prior manifest; any drift causes a hard refusal instead.
-function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, force }) {
+function preflightAgentGroup({
+  targetDir,
+  harness,
+  skill,
+  files,
+  getInstalledSkillAgentFiles,
+  force,
+}) {
   const stat = lstatIfExists(targetDir);
   if (stat !== null) {
     if (stat.isSymbolicLink()) {
@@ -772,23 +1985,170 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
       skill,
       exactHarness: harness,
     });
+    if (manifestState(manifestResult.manifest) !== MANIFEST_STATE_COMPLETE) {
+      throw new Error(
+        `Refusing to install: agent ownership manifest is not complete: ${manifestResult.manifestPath}`,
+      );
+    }
   }
-  const ownedHashes = new Map();
+
+  const transactionResult = readTransactionIfExists(targetDir);
+  if (transactionResult.exists) {
+    assertJournalIsNotActive(
+      transactionResult.manifestPath,
+      transactionResult.manifest.ownerProcessId,
+    );
+    assertManifestOwnership(
+      transactionResult.manifest,
+      transactionResult.manifestPath,
+      {
+        skill,
+        exactHarness: harness,
+      },
+    );
+    if (
+      manifestState(transactionResult.manifest) !==
+      MANIFEST_STATE_INSTALLING
+    ) {
+      throw new Error(
+        `Refusing to install: invalid ownership transaction: ${transactionResult.manifestPath}`,
+      );
+    }
+  }
+
+  const requiredManifestFiles = agentManifestFiles(files);
+  const requiredFilenames = requiredManifestFiles.map((file) => file.path);
+  const requiredHashes = new Map(
+    requiredManifestFiles.map((file) => [file.path, file.sha256]),
+  );
+  let completedBeforeTransactionCleanup = false;
+  let transactionOwnedFiles = [];
+  if (transactionResult.exists) {
+    const previousManifestSha256 =
+      transactionResult.manifest.previousManifestSha256;
+    let referencesCurrentManifest = false;
+    if (manifestResult.exists) {
+      referencesCurrentManifest =
+        previousManifestSha256 === manifestResult.contentHash;
+      completedBeforeTransactionCleanup = sameManifestFiles(
+        transactionResult.manifest.files,
+        manifestResult.manifest.files,
+      );
+      if (!referencesCurrentManifest && !completedBeforeTransactionCleanup) {
+        throw new Error(
+          `Refusing to install: ownership transaction is not linked to the completed manifest: ${transactionResult.manifestPath}`,
+        );
+      }
+    } else if (previousManifestSha256 !== null) {
+      throw new Error(
+        `Refusing to install: ownership transaction references a missing completed manifest: ${transactionResult.manifestPath}`,
+      );
+    }
+
+    const matchesValidatedSource = sameManifestFiles(
+      transactionResult.manifest.files,
+      requiredManifestFiles,
+    );
+    if (completedBeforeTransactionCleanup || matchesValidatedSource) {
+      transactionOwnedFiles = transactionResult.manifest.files;
+    } else {
+      const completedPaths = new Set(
+        manifestResult.exists
+          ? manifestResult.manifest.files.map((file) => file.path)
+          : [],
+      );
+      const provisionallyOwnedFiles = [];
+      const unresolvedFiles = [];
+      for (const file of transactionResult.manifest.files) {
+        if (
+          completedPaths.has(file.path) ||
+          requiredHashes.get(file.path) === file.sha256
+        ) {
+          provisionallyOwnedFiles.push(file);
+        } else {
+          unresolvedFiles.push(file);
+        }
+      }
+
+      const unresolvedExistingFiles = unresolvedFiles.filter((file) => {
+        const filePath = resolveSafeAgentFilePath(
+          targetDir,
+          harness,
+          file.path,
+          "agent destination",
+        );
+        return lstatIfExists(filePath) !== null;
+      });
+      let matchesInstalledSkillSnapshot = false;
+      if (unresolvedExistingFiles.length > 0) {
+        const installedSkillAgentFiles =
+          getInstalledSkillAgentFiles?.();
+        matchesInstalledSkillSnapshot =
+          installedSkillAgentFiles !== undefined &&
+          sameManifestFiles(
+            transactionResult.manifest.files,
+            installedSkillAgentFiles,
+          );
+      }
+
+      if (matchesInstalledSkillSnapshot) {
+        transactionOwnedFiles = transactionResult.manifest.files;
+      } else {
+        if (unresolvedExistingFiles.length > 0) {
+          throw new Error(
+            `Refusing to install: ownership transaction claims an unowned agent file: ${transactionResult.manifestPath}`,
+          );
+        }
+        transactionOwnedFiles = provisionallyOwnedFiles;
+      }
+    }
+  }
+
+  const allowedOwnedHashes = new Map();
   if (manifestResult.exists) {
     for (const file of manifestResult.manifest.files) {
-      ownedHashes.set(file.path, file.sha256);
+      allowedOwnedHashes.set(file.path, new Set([file.sha256]));
+    }
+  }
+  if (transactionResult.exists) {
+    for (const file of transactionOwnedFiles) {
+      const hashes = allowedOwnedHashes.get(file.path) ?? new Set();
+      hashes.add(file.sha256);
+      allowedOwnedHashes.set(file.path, hashes);
     }
   }
 
   const requiredSet = new Set(requiredFilenames);
-  // A valid, correctly-scoped manifest already existing at this target
-  // means there was a prior install here, even if every payload file it
-  // lists has since been removed by hand. The per-file loops below only ever
-  // *upgrade* this to
-  // true on a hash match; without this seed, an owner whose files were all
-  // deleted but whose manifest survived would see no collision at all and
-  // proceed without --force.
-  let hasOwnedCollision = manifestResult.exists;
+  const hasOwnedCollision = manifestResult.exists || transactionResult.exists;
+  const expectedFileStates = new Map();
+  const existingOwnedPaths = new Set();
+
+  for (const [filename, allowedHashes] of allowedOwnedHashes) {
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      filename,
+      "agent destination",
+    );
+    const fileStat = lstatIfExists(filePath);
+    if (fileStat === null) {
+      expectedFileStates.set(filename, null);
+      continue;
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      throw new Error(
+        `Refusing to install: existing agent file must be a regular file: ${filePath}`,
+      );
+    }
+    const actualHash = sha256(readFileSync(filePath));
+    if (!allowedHashes.has(actualHash)) {
+      throw new Error(
+        `Refusing to install: file has drifted from the installer manifest, refusing to modify it: ${filePath}`,
+      );
+    }
+    expectedFileStates.set(filename, actualHash);
+    existingOwnedPaths.add(filename);
+  }
 
   for (const filename of requiredFilenames) {
     const filePath = resolveSafeAgentFilePath(
@@ -799,6 +2159,9 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
     );
     const fileStat = lstatIfExists(filePath);
     if (fileStat === null) {
+      if (!expectedFileStates.has(filename)) {
+        expectedFileStates.set(filename, null);
+      }
       continue;
     }
     if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
@@ -806,49 +2169,19 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
         `Refusing to install: existing agent file must be a regular file: ${filePath}`,
       );
     }
-    if (!ownedHashes.has(filename)) {
+    if (!allowedOwnedHashes.has(filename)) {
       throw new Error(
         `Refusing to install: an unmanaged agent file already exists: ${filePath}`,
       );
     }
-    const actualHash = sha256(readFileSync(filePath));
-    if (actualHash !== ownedHashes.get(filename)) {
-      throw new Error(
-        `Refusing to install: file has drifted from the installer manifest, refusing to modify it: ${filePath}`,
-      );
-    }
-    hasOwnedCollision = true;
   }
 
   const staleFilenames = [];
-  for (const [filename, expectedHash] of ownedHashes) {
-    if (requiredSet.has(filename)) {
+  for (const filename of allowedOwnedHashes.keys()) {
+    if (requiredSet.has(filename) || !existingOwnedPaths.has(filename)) {
       continue;
-    }
-    const filePath = resolveSafeAgentFilePath(
-      targetDir,
-      harness,
-      filename,
-      "agent destination",
-    );
-    const fileStat = lstatIfExists(filePath);
-    if (fileStat === null) {
-      // Already gone (e.g. removed by hand); nothing to clean up.
-      continue;
-    }
-    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
-      throw new Error(
-        `Refusing to install: existing agent file must be a regular file: ${filePath}`,
-      );
-    }
-    const actualHash = sha256(readFileSync(filePath));
-    if (actualHash !== expectedHash) {
-      throw new Error(
-        `Refusing to install: file has drifted from the installer manifest, refusing to modify it: ${filePath}`,
-      );
     }
     staleFilenames.push(filename);
-    hasOwnedCollision = true;
   }
 
   if (hasOwnedCollision && !force) {
@@ -857,41 +2190,357 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
     );
   }
 
-  return { staleFilenames };
+  return {
+    expectedFileStates,
+    expectedManifestHash: manifestResult.exists
+      ? manifestResult.contentHash
+      : null,
+    expectedTransactionHash: transactionResult.exists
+      ? transactionResult.contentHash
+      : null,
+    completedTransactionNeedsCleanup:
+      transactionResult.exists && completedBeforeTransactionCleanup,
+    previousManifestSha256: manifestResult.exists
+      ? manifestResult.contentHash
+      : null,
+    staleFilenames,
+    targetIdentity:
+      stat === null ? null : { device: stat.dev, inode: stat.ino },
+  };
 }
 
 function installSkillGroup({
+  resolvedHome,
   targetDir,
   existed,
+  expectedFiles,
+  expectedManifestHash,
   finalHarnesses,
+  allowedHarnesses,
+  targetIdentity,
   skill,
   skillVersion,
-  sourceSkillDir,
   sourceFiles,
   resolvedProjectRoot,
+  onInstallEvent,
 }) {
-  if (existed) {
-    rmSync(targetDir, { recursive: true, force: true });
+  const parentDir = dirname(targetDir);
+  const stageDir = uniqueSiblingPath(targetDir, "knights-stage");
+  assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+  mkdirSync(parentDir, { recursive: true });
+  assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+  syncDirectoryChain(resolvedHome, parentDir);
+  const parentStat = lstatSync(parentDir);
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error(
+      `Refusing to install: skill parent directory is unsafe: ${parentDir}`,
+    );
   }
-  mkdirSync(targetDir, { recursive: true });
-  cpSync(sourceSkillDir, targetDir, {
-    recursive: true,
-    dereference: false,
-    errorOnExist: false,
-    force: true,
-  });
+  const parentIdentity = directoryIdentity(parentStat);
+  mkdirSync(stageDir, { mode: 0o755 });
+  syncDirectory(parentDir);
+  const stageIdentity = directoryIdentity(lstatSync(stageDir));
 
-  const manifest = buildManifest({
-    skill,
-    skillVersion,
-    source: resolvedProjectRoot,
-    harnesses: finalHarnesses,
-    files: sourceFiles.map((file) => ({
-      path: file.relativePath,
-      sha256: file.sha256,
-    })),
-  });
-  writeFileSync(join(targetDir, MANIFEST_FILENAME), serializeManifest(manifest));
+  const stagedDirectories = new Set([stageDir]);
+  let activeJournalPath;
+  let stagePublished = false;
+  let preserveStageForRecovery = false;
+  try {
+    const manifestFiles = [];
+    for (const file of sourceFiles) {
+      const filePath = resolve(stageDir, file.relativePath);
+      if (!isContainedPath(stageDir, filePath)) {
+        throw new Error(
+          `Refusing to install: validated skill file escapes the stage: ${file.relativePath}`,
+        );
+      }
+      const fileDirectory = dirname(filePath);
+      mkdirSync(fileDirectory, { recursive: true });
+      addDirectoryChain(stagedDirectories, stageDir, fileDirectory);
+      writeDurableNewFile(filePath, file.content);
+      manifestFiles.push({
+        path: file.relativePath,
+        sha256: sha256(file.content),
+      });
+    }
+
+    onInstallEvent({ phase: "before-skill-manifest", targetDir });
+    assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+    assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
+    assertSkillPayloadSnapshot({
+      directory: stageDir,
+      expectedIdentity: stageIdentity,
+      expectedFiles: manifestFiles,
+      description: "skill stage",
+    });
+    const manifest = buildManifest({
+      skill,
+      skillVersion,
+      source: resolvedProjectRoot,
+      harnesses: finalHarnesses,
+      files: manifestFiles,
+    });
+    const serializedSkillManifest = serializeManifest(manifest);
+    writeDurableNewFile(
+      join(stageDir, MANIFEST_FILENAME),
+      serializedSkillManifest,
+    );
+
+    for (const directory of [...stagedDirectories].sort(
+      (left, right) => right.length - left.length,
+    )) {
+      syncDirectory(directory);
+    }
+    syncDirectory(parentDir);
+
+    onInstallEvent({ phase: "before-skill-swap", targetDir });
+    assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+    assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
+    assertDirectoryIdentity(stageDir, stageIdentity, "skill stage");
+    const stagedManifestSha256 = sha256(
+      Buffer.from(serializedSkillManifest, "utf8"),
+    );
+    assertCompleteSkillDirectory({
+      directory: stageDir,
+      expectedManifestHash: stagedManifestSha256,
+      skill,
+      allowedHarnesses,
+      description: "skill stage",
+    });
+    assertSkillDestinationUnchanged({
+      targetDir,
+      existed,
+      expectedFiles,
+      expectedManifestHash,
+      targetIdentity,
+    });
+    if (!existed) {
+      renameSync(stageDir, targetDir);
+      stagePublished = true;
+      syncDirectory(parentDir);
+      assertCompleteSkillDirectory({
+        directory: targetDir,
+        expectedManifestHash: stagedManifestSha256,
+        skill,
+        allowedHarnesses,
+        description: "published skill",
+      });
+    } else {
+      const backupDir = uniqueSiblingPath(targetDir, "knights-backup");
+      const journalPath = skillSwapJournalPath(targetDir);
+      assertPathStillMissing(journalPath, "skill swap journal");
+      const swapJournal = {
+        schemaVersion: SKILL_SWAP_JOURNAL_SCHEMA_VERSION,
+        installer: INSTALLER_ID,
+        state: SKILL_SWAP_JOURNAL_STATE_PREPARED,
+        ownerProcessId: process.pid,
+        targetName: basename(targetDir),
+        stageName: basename(stageDir),
+        stageIdentity: serializedDirectoryIdentity(stageIdentity),
+        priorIdentity: serializedDirectoryIdentity(targetIdentity),
+        stagedFiles: normalizedManifestFiles(manifestFiles),
+        priorFiles: normalizedManifestFiles(expectedFiles),
+        stagedManifestSha256,
+        priorManifestSha256: expectedManifestHash,
+      };
+      const serializedSwapJournal = `${JSON.stringify(swapJournal, null, 2)}\n`;
+      const swapJournalHash = sha256(
+        Buffer.from(serializedSwapJournal, "utf8"),
+      );
+      writeExclusiveAtomicFile(journalPath, serializedSwapJournal);
+      const createdJournal = readSkillSwapJournalIfExists(targetDir);
+      if (
+        !createdJournal.exists ||
+        createdJournal.contentHash !== swapJournalHash
+      ) {
+        throw new Error(
+          `Refusing to install: skill swap journal changed during creation: ${journalPath}`,
+        );
+      }
+      const swapJournalIdentity = createdJournal.identity;
+      activeJournalPath = journalPath;
+      ACTIVE_OWNERSHIP_JOURNALS.add(journalPath);
+      onInstallEvent({ phase: "after-skill-swap-journal", targetDir });
+      assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+      assertDirectoryIdentity(parentDir, parentIdentity, "skill parent directory");
+      assertCompleteSkillDirectory({
+        directory: stageDir,
+        expectedManifestHash: stagedManifestSha256,
+        skill,
+        allowedHarnesses,
+        description: "skill stage",
+      });
+      assertSkillDestinationUnchanged({
+        targetDir,
+        existed,
+        expectedFiles,
+        expectedManifestHash,
+        targetIdentity,
+      });
+
+      let backupMoved = false;
+      try {
+        assertPathStillMissing(backupDir, "skill swap backup");
+        renameSync(targetDir, backupDir);
+        backupMoved = true;
+        syncDirectory(parentDir);
+        onInstallEvent({ phase: "after-skill-backup", targetDir });
+        assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+        assertDirectoryIdentity(
+          parentDir,
+          parentIdentity,
+          "skill parent directory",
+        );
+        assertPathStillMissing(targetDir, "skill destination");
+        assertDirectoryIdentity(stageDir, stageIdentity, "skill stage");
+        assertCompleteSkillDirectory({
+          directory: stageDir,
+          expectedManifestHash: stagedManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "skill stage",
+        });
+        assertDirectoryIdentity(
+          backupDir,
+          targetIdentity,
+          "skill swap backup",
+        );
+        assertCompleteSkillDirectory({
+          directory: backupDir,
+          expectedManifestHash,
+          skill,
+          allowedHarnesses,
+          description: "skill swap backup",
+        });
+        renameSync(stageDir, targetDir);
+        stagePublished = true;
+        syncDirectory(parentDir);
+        onInstallEvent({
+          phase: "before-skill-backup-cleanup",
+          targetDir,
+        });
+        assertSafeAncestors(resolvedHome, targetDir, "Skill destination");
+        assertDirectoryIdentity(
+          parentDir,
+          parentIdentity,
+          "skill parent directory",
+        );
+        assertDirectoryIdentity(
+          targetDir,
+          stageIdentity,
+          "published skill",
+        );
+        assertCompleteSkillDirectory({
+          directory: targetDir,
+          expectedManifestHash: stagedManifestSha256,
+          skill,
+          allowedHarnesses,
+          description: "published skill",
+        });
+        assertCompleteSkillDirectory({
+          directory: backupDir,
+          expectedManifestHash,
+          skill,
+          allowedHarnesses,
+          description: "skill swap backup",
+        });
+        const currentJournal = readSkillSwapJournalIfExists(targetDir);
+        if (
+          !currentJournal.exists ||
+          currentJournal.contentHash !== swapJournalHash ||
+          currentJournal.identity.device !== swapJournalIdentity.device ||
+          currentJournal.identity.inode !== swapJournalIdentity.inode
+        ) {
+          throw new Error(
+            `Refusing to install: skill swap journal changed during installation: ${journalPath}`,
+          );
+        }
+        removeOwnedSkillDirectoryIncrementally({
+          directory: backupDir,
+          expectedIdentity: serializedDirectoryIdentity(targetIdentity),
+          expectedManifestHash,
+          expectedFiles,
+          skill,
+          allowedHarnesses,
+          description: "skill swap backup",
+          beforeManifestRemoval: () =>
+            onInstallEvent({
+              phase: "before-skill-backup-manifest-cleanup",
+              targetDir,
+            }),
+        });
+        backupMoved = false;
+        rmSync(journalPath, { force: true });
+        syncDirectory(parentDir);
+      } catch (error) {
+        if (backupMoved && !stagePublished) {
+          try {
+            assertSafeAncestors(
+              resolvedHome,
+              targetDir,
+              "Skill destination",
+            );
+            assertDirectoryIdentity(
+              parentDir,
+              parentIdentity,
+              "skill parent directory",
+            );
+            assertPathStillMissing(targetDir, "skill destination");
+            assertDirectoryIdentity(
+              backupDir,
+              targetIdentity,
+              "skill swap backup",
+            );
+            assertCompleteSkillDirectory({
+              directory: backupDir,
+              expectedManifestHash,
+              skill,
+              allowedHarnesses,
+              description: "skill swap backup",
+            });
+            renameSync(backupDir, targetDir);
+            backupMoved = false;
+            syncDirectory(parentDir);
+            const currentJournalStat = lstatIfExists(journalPath);
+            if (
+              currentJournalStat !== null &&
+              !currentJournalStat.isSymbolicLink() &&
+              currentJournalStat.isFile() &&
+              currentJournalStat.dev === swapJournalIdentity.device &&
+              currentJournalStat.ino === swapJournalIdentity.inode &&
+              sha256(readFileSync(journalPath)) === swapJournalHash
+            ) {
+              rmSync(journalPath);
+              syncDirectory(parentDir);
+            }
+          } catch (rollbackError) {
+            preserveStageForRecovery = true;
+            throw new AggregateError(
+              [error, rollbackError],
+              `Failed to publish staged skill and restore prior install: ${targetDir}`,
+            );
+          }
+        }
+        throw error;
+      }
+    }
+  } finally {
+    if (activeJournalPath !== undefined) {
+      ACTIVE_OWNERSHIP_JOURNALS.delete(activeJournalPath);
+    }
+    if (!stagePublished && !preserveStageForRecovery) {
+      const stageStat = lstatIfExists(stageDir);
+      if (
+        stageStat !== null &&
+        stageStat.dev === stageIdentity.device &&
+        stageStat.ino === stageIdentity.inode &&
+        !stageStat.isSymbolicLink() &&
+        stageStat.isDirectory()
+      ) {
+        rmSync(stageDir, { recursive: true, force: true });
+      }
+    }
+  }
 
   return [
     targetDir,
@@ -900,22 +2549,160 @@ function installSkillGroup({
   ];
 }
 
+function assertAgentDestinationUnchanged({
+  resolvedHome,
+  targetDir,
+  targetIdentity,
+  harness,
+  expectedManifestHash,
+  expectedTransactionHash,
+  expectedFileStates,
+}) {
+  assertSafeAncestors(resolvedHome, targetDir, "Agent destination");
+  assertDirectoryIdentity(targetDir, targetIdentity, "agent directory");
+  assertManifestHash(targetDir, MANIFEST_FILENAME, expectedManifestHash);
+  assertManifestHash(
+    targetDir,
+    TRANSACTION_FILENAME,
+    expectedTransactionHash,
+  );
+  assertAgentFileStates(targetDir, harness, expectedFileStates);
+}
+
 function installAgentGroup({
+  resolvedHome,
   targetDir,
   harness,
   files,
+  completedTransactionNeedsCleanup,
+  expectedFileStates,
+  expectedManifestHash,
+  expectedTransactionHash,
+  previousManifestSha256,
   staleFilenames = [],
+  targetIdentity,
   skill,
   skillVersion,
   resolvedProjectRoot,
+  onInstallEvent,
 }) {
+  assertSafeAncestors(resolvedHome, targetDir, "Agent destination");
+  if (targetIdentity === null) {
+    assertPathStillMissing(targetDir, "agent directory");
+  } else {
+    assertDirectoryIdentity(targetDir, targetIdentity, "agent directory");
+  }
   mkdirSync(targetDir, { recursive: true });
+  syncDirectoryChain(resolvedHome, targetDir);
+  const installedTargetIdentity =
+    targetIdentity ?? directoryIdentity(lstatSync(targetDir));
 
-  // Remove stale owned files (preflightAgentGroup has already verified each
-  // one still matches the hash recorded in the prior manifest) before
-  // writing the current set, so a renamed or removed reviewer agent never
-  // lingers as an unmanaged collision blocking a future install.
+  const manifestFiles = agentManifestFiles(files);
+  const manifestPath = join(targetDir, MANIFEST_FILENAME);
+  const transactionPath = join(targetDir, TRANSACTION_FILENAME);
+  const transactionManifest = buildManifest({
+    skill,
+    skillVersion,
+    source: resolvedProjectRoot,
+    harnesses: [harness],
+    files: manifestFiles,
+    state: MANIFEST_STATE_INSTALLING,
+    previousManifestSha256,
+  });
+  const serializedTransactionManifest =
+    serializeManifest(transactionManifest);
+  let journalIsActive = false;
+  try {
+    assertAgentDestinationUnchanged({
+      resolvedHome,
+      targetDir,
+      targetIdentity: installedTargetIdentity,
+      harness,
+      expectedManifestHash,
+      expectedTransactionHash,
+      expectedFileStates,
+    });
+    if (completedTransactionNeedsCleanup) {
+      rmSync(transactionPath, { force: true });
+      syncDirectory(targetDir);
+      expectedTransactionHash = null;
+    }
+    onInstallEvent({
+      phase: "before-agent-transaction-manifest",
+      targetDir,
+      harness,
+    });
+    assertAgentDestinationUnchanged({
+      resolvedHome,
+      targetDir,
+      targetIdentity: installedTargetIdentity,
+      harness,
+      expectedManifestHash,
+      expectedTransactionHash,
+      expectedFileStates,
+    });
+    if (expectedTransactionHash === null) {
+      writeExclusiveAtomicFile(
+        transactionPath,
+        serializedTransactionManifest,
+      );
+    } else {
+      writeAtomicFile(transactionPath, serializedTransactionManifest);
+    }
+    expectedTransactionHash = sha256(
+      Buffer.from(serializedTransactionManifest, "utf8"),
+    );
+    ACTIVE_OWNERSHIP_JOURNALS.add(transactionPath);
+    journalIsActive = true;
+    onInstallEvent({
+      phase: "after-agent-transaction-manifest",
+      targetDir,
+      harness,
+    });
+
+    const installedPaths = [];
+  for (const [fileIndex, file] of files.entries()) {
+    assertAgentDestinationUnchanged({
+      resolvedHome,
+      targetDir,
+      targetIdentity: installedTargetIdentity,
+      harness,
+      expectedManifestHash,
+      expectedTransactionHash,
+      expectedFileStates,
+    });
+    const filePath = resolveSafeAgentFilePath(
+      targetDir,
+      harness,
+      file.filename,
+      "agent destination",
+    );
+    writeAtomicFile(filePath, file.content);
+    expectedFileStates.set(file.filename, sha256(file.content));
+    installedPaths.push(filePath);
+    onInstallEvent({
+      phase: "after-agent-file",
+      targetDir,
+      harness,
+      filename: file.filename,
+      fileIndex,
+    });
+  }
+
+  // The retained completed manifest authenticates the prior path set, while
+  // the linked transaction journal records the desired path set before stale
+  // files are removed. A later forced run can therefore distinguish an
+  // expected absence from an unowned collision.
   for (const filename of staleFilenames) {
+    assertAgentDestinationUnchanged({
+      resolvedHome,
+      targetDir,
+      targetIdentity: installedTargetIdentity,
+      harness,
+      expectedManifestHash,
+      expectedTransactionHash,
+      expectedFileStates,
+    });
     const filePath = resolveSafeAgentFilePath(
       targetDir,
       harness,
@@ -923,32 +2710,66 @@ function installAgentGroup({
       "agent destination",
     );
     rmSync(filePath, { force: true });
+    expectedFileStates.set(filename, null);
+  }
+  if (staleFilenames.length > 0) {
+    syncDirectory(targetDir);
   }
 
-  const installedPaths = [];
-  for (const file of files) {
-    const filePath = resolveSafeAgentFilePath(
-      targetDir,
-      harness,
-      file.filename,
-      "agent destination",
-    );
-    writeFileSync(filePath, file.content);
-    installedPaths.push(filePath);
-  }
-
-  const manifest = buildManifest({
+  assertAgentDestinationUnchanged({
+    resolvedHome,
+    targetDir,
+    targetIdentity: installedTargetIdentity,
+    harness,
+    expectedManifestHash,
+    expectedTransactionHash,
+    expectedFileStates,
+  });
+  const completedManifest = buildManifest({
     skill,
     skillVersion,
     source: resolvedProjectRoot,
     harnesses: [harness],
-    files: files.map((file) => ({ path: file.filename, sha256: file.sha256 })),
+    files: manifestFiles,
   });
-  const manifestPath = join(targetDir, MANIFEST_FILENAME);
-  writeFileSync(manifestPath, serializeManifest(manifest));
-  installedPaths.push(manifestPath);
+  const serializedCompletedManifest = serializeManifest(completedManifest);
+  writeAtomicFile(manifestPath, serializedCompletedManifest);
+  expectedManifestHash = sha256(
+    Buffer.from(serializedCompletedManifest, "utf8"),
+  );
+  assertAgentDestinationUnchanged({
+    resolvedHome,
+    targetDir,
+    targetIdentity: installedTargetIdentity,
+    harness,
+    expectedManifestHash,
+    expectedTransactionHash,
+    expectedFileStates,
+  });
+  onInstallEvent({
+    phase: "before-agent-transaction-cleanup",
+    targetDir,
+    harness,
+  });
+  assertAgentDestinationUnchanged({
+    resolvedHome,
+    targetDir,
+    targetIdentity: installedTargetIdentity,
+    harness,
+    expectedManifestHash,
+    expectedTransactionHash,
+    expectedFileStates,
+  });
+    rmSync(transactionPath, { force: true });
+    syncDirectory(targetDir);
+    installedPaths.push(manifestPath);
 
-  return installedPaths;
+    return installedPaths;
+  } finally {
+    if (journalIsActive) {
+      ACTIVE_OWNERSHIP_JOURNALS.delete(transactionPath);
+    }
+  }
 }
 
 export function install(options = {}) {
@@ -957,6 +2778,10 @@ export function install(options = {}) {
 
   const harnesses = normalizeHarnesses(options.harnesses ?? ["all"]);
   const force = options.force === true;
+  const onInstallEvent = options.onInstallEvent ?? (() => {});
+  if (typeof onInstallEvent !== "function") {
+    throw new Error("onInstallEvent must be a function");
+  }
   if (options.home !== undefined) {
     assertSafeHome(options.home);
   }
@@ -967,6 +2792,7 @@ export function install(options = {}) {
   // yet, so any failure here leaves the home directory byte-for-byte
   // unmodified (item 11).
   const source = validateSource({ projectRoot, skill, harnesses });
+  onInstallEvent({ phase: "source-validated" });
 
   // Phase 2: build the destination plan (pure data, no filesystem access).
   const skillGroups = SKILL_INSTALL_GROUPS.filter((group) =>
@@ -987,27 +2813,138 @@ export function install(options = {}) {
       }))
     : [];
 
+  // Restore or finalize any previously journaled whole-skill swap before
+  // ordinary ownership preflight. Recovery only touches artifacts named and
+  // hash-verified by this installer, never unrelated siblings.
+  for (const group of skillGroups) {
+    recoverInterruptedSkillSwap({
+      resolvedHome,
+      targetDir: group.targetDir,
+      skill,
+      allowedHarnesses: group.harnesses,
+      onInstallEvent,
+    });
+  }
+
   // Phase 3: preflight every selected harness's destination before any
   // mutation, so a collision or safety failure in one harness causes zero
   // changes to every harness (item 13).
   const skillPreflight = skillGroups.map((group) => {
     assertSafeAncestors(resolvedHome, group.targetDir, "Skill destination");
-    const { existed, priorHarnesses } = preflightSkillGroup({
+    const preflight = preflightSkillGroup({
       targetDir: group.targetDir,
       skill,
       allowedHarnesses: group.harnesses,
       force,
     });
+    const finalHarnesses = mergedHarnesses(
+      preflight.priorHarnesses,
+      group.selectedHarnesses,
+      group.harnesses,
+    );
     return {
       group,
-      existed,
-      finalHarnesses: mergedHarnesses(
-        priorHarnesses,
-        group.selectedHarnesses,
-        group.harnesses,
-      ),
+      ...preflight,
+      finalHarnesses,
     };
   });
+
+  // Complete every interrupted agent transaction that depends on one of the
+  // skill snapshots above before replacing that snapshot. This includes an
+  // unselected sibling in a shared Codex/Gemini skill directory. Completing
+  // the old transaction first also prevents a later transaction journal from
+  // becoming the only surviving ownership record for bytes written by the
+  // interrupted operation.
+  const interruptedAgentRecovery = [];
+  if (source.isKnightsSkill) {
+    for (const skillSnapshot of skillPreflight) {
+      const pendingAgentGroups = skillSnapshot.group.harnesses
+        .map((harness) => ({
+          harness,
+          targetDir: resolve(
+            resolvedHome,
+            AGENT_HARNESS_DIRS[harness],
+          ),
+        }))
+        .filter((agentGroup) => {
+          assertSafeAncestors(
+            resolvedHome,
+            agentGroup.targetDir,
+            "Agent destination",
+          );
+          return readTransactionIfExists(agentGroup.targetDir).exists;
+        });
+
+      if (pendingAgentGroups.length === 0) {
+        continue;
+      }
+      if (skillSnapshot.priorManifest === null) {
+        throw new Error(
+          `Refusing to install: interrupted agent transaction has no installed skill snapshot: ${skillSnapshot.group.targetDir}`,
+        );
+      }
+
+      const recoveryPayloads = deriveInstalledSkillAgentPayloads({
+        directory: skillSnapshot.group.targetDir,
+        manifest: skillSnapshot.priorManifest,
+        harnesses: pendingAgentGroups.map(({ harness }) => harness),
+      });
+      for (const agentGroup of pendingAgentGroups) {
+        const files = recoveryPayloads[agentGroup.harness];
+        const preflight = preflightAgentGroup({
+          targetDir: agentGroup.targetDir,
+          harness: agentGroup.harness,
+          skill,
+          files,
+          getInstalledSkillAgentFiles: () => agentManifestFiles(files),
+          force,
+        });
+        interruptedAgentRecovery.push({
+          agentGroup: { ...agentGroup, files },
+          skillVersion: skillSnapshot.priorManifest.skillVersion,
+          resolvedProjectRoot: skillSnapshot.priorManifest.source,
+          ...preflight,
+        });
+      }
+    }
+  }
+
+  // Recovery is part of the earlier interrupted operation. All recovery
+  // destinations have been preflighted above, and every write remains
+  // protected by the retained transaction journal and captured file states.
+  const installedPaths = [];
+  for (const {
+    agentGroup,
+    completedTransactionNeedsCleanup,
+    expectedFileStates,
+    expectedManifestHash,
+    expectedTransactionHash,
+    previousManifestSha256,
+    resolvedProjectRoot,
+    skillVersion,
+    staleFilenames,
+    targetIdentity,
+  } of interruptedAgentRecovery) {
+    installedPaths.push(
+      ...installAgentGroup({
+        resolvedHome,
+        targetDir: agentGroup.targetDir,
+        harness: agentGroup.harness,
+        files: agentGroup.files,
+        completedTransactionNeedsCleanup,
+        expectedFileStates,
+        expectedManifestHash,
+        expectedTransactionHash,
+        previousManifestSha256,
+        staleFilenames,
+        targetIdentity,
+        skill,
+        skillVersion,
+        resolvedProjectRoot,
+        onInstallEvent,
+      }),
+    );
+  }
 
   const agentPreflight = agentGroups.map((agentGroup) => {
     assertSafeAncestors(
@@ -1015,44 +2952,88 @@ export function install(options = {}) {
       agentGroup.targetDir,
       "Agent destination",
     );
-    const { staleFilenames } = preflightAgentGroup({
+    const skillSnapshot = skillPreflight.find(({ group }) =>
+      group.harnesses.includes(agentGroup.harness),
+    );
+    const preflight = preflightAgentGroup({
       targetDir: agentGroup.targetDir,
       harness: agentGroup.harness,
       skill,
-      requiredFilenames: agentGroup.files.map((file) => file.filename),
+      files: agentGroup.files,
+      getInstalledSkillAgentFiles: () => {
+        if (
+          skillSnapshot === undefined ||
+          skillSnapshot.priorManifest === null
+        ) {
+          return undefined;
+        }
+        return deriveInstalledSkillAgentFiles({
+          directory: skillSnapshot.group.targetDir,
+          manifest: skillSnapshot.priorManifest,
+          harnesses: [agentGroup.harness],
+        })[agentGroup.harness];
+      },
       force,
     });
-    return { agentGroup, staleFilenames };
+    return { agentGroup, ...preflight };
   });
 
-  // Phase 4: every check above passed, so it is now safe to mutate.
-  const installedPaths = [];
-
-  for (const { group, existed, finalHarnesses } of skillPreflight) {
+  // Phase 4: every current-install check above passed, so it is now safe to
+  // publish the new skill snapshots and agent payloads.
+  for (const {
+    group,
+    existed,
+    expectedFiles,
+    expectedManifestHash,
+    finalHarnesses,
+    targetIdentity,
+  } of skillPreflight) {
     installedPaths.push(
       ...installSkillGroup({
+        resolvedHome,
         targetDir: group.targetDir,
         existed,
+        expectedFiles,
+        expectedManifestHash,
         finalHarnesses,
+        allowedHarnesses: group.harnesses,
+        targetIdentity,
         skill,
         skillVersion: source.skillVersion,
-        sourceSkillDir: source.skillDir,
         sourceFiles: source.files,
         resolvedProjectRoot: source.resolvedProjectRoot,
+        onInstallEvent,
       }),
     );
   }
 
-  for (const { agentGroup, staleFilenames } of agentPreflight) {
+  for (const {
+    agentGroup,
+    completedTransactionNeedsCleanup,
+    expectedFileStates,
+    expectedManifestHash,
+    expectedTransactionHash,
+    previousManifestSha256,
+    staleFilenames,
+    targetIdentity,
+  } of agentPreflight) {
     installedPaths.push(
       ...installAgentGroup({
+        resolvedHome,
         targetDir: agentGroup.targetDir,
         harness: agentGroup.harness,
         files: agentGroup.files,
+        completedTransactionNeedsCleanup,
+        expectedFileStates,
+        expectedManifestHash,
+        expectedTransactionHash,
+        previousManifestSha256,
         staleFilenames,
+        targetIdentity,
         skill,
         skillVersion: source.skillVersion,
         resolvedProjectRoot: source.resolvedProjectRoot,
+        onInstallEvent,
       }),
     );
   }
