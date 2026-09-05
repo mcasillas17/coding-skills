@@ -1142,6 +1142,29 @@ test("installs a non-canonical skill without copying reviewer agents", (t) => {
   assert.equal(existsSync(join(home, ".claude/agents")), false);
 });
 
+test("rejects a source skill containing a top-level reserved manifest filename before any destination mutation", (t) => {
+  const projectRoot = withFixture(t);
+  const skillDir = createGenericSkillFixture(projectRoot, "other-skill");
+  writeFileSync(
+    join(skillDir, ".knights-install.json"),
+    JSON.stringify({ bogus: "payload" }),
+  );
+  const home = withHome(t);
+
+  assert.throws(
+    () =>
+      install({
+        projectRoot,
+        home,
+        skill: "other-skill",
+        harnesses: ["claude"],
+      }),
+    /reserved/i,
+  );
+
+  assert.deepEqual(listEntries(home), []);
+});
+
 test("CLI installs the canonical skill from the repository for a single harness", (t) => {
   const home = withHome(t);
 

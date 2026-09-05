@@ -479,7 +479,12 @@ function parseFrontmatter(text, sourceLabel) {
 
 // Recursively reads the source skill directory, rejecting symlinks and any
 // non-regular entries, and returns the sorted file list with content and
-// hashes (item 11).
+// hashes (item 11). The top-level manifest filename is reserved for
+// installer-owned metadata (written by installSkillGroup) and must not
+// exist as payload in the source tree, or a first install would silently
+// overwrite it and a later force update would be permanently unable to
+// reconcile it against `walkExistingDestinationFiles`, which excludes that
+// same top-level filename as metadata, not tracked payload.
 function readSourceSkillTree(skillDir, realSkillDir) {
   const files = [];
 
@@ -492,6 +497,11 @@ function readSourceSkillTree(skillDir, realSkillDir) {
       const relativePath =
         relativeDir === "" ? entry.name : `${relativeDir}/${entry.name}`;
 
+      if (relativeDir === "" && entry.name === MANIFEST_FILENAME) {
+        throw new Error(
+          `Skill source contains a reserved filename: ${relativePath}`,
+        );
+      }
       if (entry.isSymbolicLink()) {
         throw new Error(
           `Skill source contains a symlink: ${relativePath}`,
