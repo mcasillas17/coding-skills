@@ -35,9 +35,18 @@ const ALL_HARNESSES = ["claude", "copilot", "codex", "gemini"];
 // one physical directory: item 6 requires a single copy/manifest, not one
 // per harness.
 const SKILL_INSTALL_GROUPS = [
-  { id: "claude", harnesses: ["claude"], relativeDir: (skill) => `.claude/skills/${skill}` },
-  { id: "copilot", harnesses: ["copilot"], relativeDir: (skill) => `.copilot/skills/${skill}` },
-  { id: "agents", harnesses: ["codex", "gemini"], relativeDir: (skill) => `.agents/skills/${skill}` },
+  {
+    harnesses: ["claude"],
+    relativeDir: (skill) => `.claude/skills/${skill}`,
+  },
+  {
+    harnesses: ["copilot"],
+    relativeDir: (skill) => `.copilot/skills/${skill}`,
+  },
+  {
+    harnesses: ["codex", "gemini"],
+    relativeDir: (skill) => `.agents/skills/${skill}`,
+  },
 ];
 
 const AGENT_HARNESS_DIRS = {
@@ -173,14 +182,13 @@ function assertValidManifestShape(manifest, manifestPath) {
 }
 
 // Proves a manifest actually belongs to the target it was found in, rather
-// than merely being *some* shape-valid manifest (Gap 1: manifest
-// association is not validated). `assertValidManifestShape` only checks
-// field types, so a manifest copied or forged from another skill or another
-// physical harness group is otherwise indistinguishable from a genuine
-// prior install once shape validation passes -- letting it be treated as
-// proof of ownership, including merging its harnesses or authorizing a
-// forced update. This check runs unconditionally, before the `--force`
-// gate, so a mismatched manifest is refused exactly like any other unowned
+// than merely being *some* shape-valid manifest. `assertValidManifestShape`
+// only checks field types, so a manifest copied or forged from another skill
+// or another physical harness group is otherwise indistinguishable from a
+// genuine prior install once shape validation passes -- letting it be treated
+// as proof of ownership, including merging its harnesses or authorizing a
+// forced update. This check runs unconditionally, before the `--force` gate,
+// so a mismatched manifest is refused exactly like any other unowned
 // collision, even with force.
 //
 // - For a skill-install manifest (`exactHarness` omitted), `harnesses` must
@@ -368,8 +376,8 @@ function assertSafeAncestors(resolvedHome, targetDir, description) {
 }
 
 // Source-side counterpart to assertSafeAncestors above, used to guard
-// checked-in source directories (Gap 3: generated-agent source directory
-// symlink). `validateGeneratedAgents` used to lstat-check only the final
+// checked-in generated-agent source directories. `validateGeneratedAgents`
+// used to lstat-check only the final
 // generated agent *files*; it never confirmed that the directory
 // containing them -- e.g. `<projectRoot>/generated/claude/agents` -- was
 // itself a real, non-symlink directory contained within the project root.
@@ -775,8 +783,8 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
   const requiredSet = new Set(requiredFilenames);
   // A valid, correctly-scoped manifest already existing at this target
   // means there was a prior install here, even if every payload file it
-  // lists has since been removed by hand (Gap 2: no-force partial-owned
-  // agent install). The per-file loops below only ever *upgrade* this to
+  // lists has since been removed by hand. The per-file loops below only ever
+  // *upgrade* this to
   // true on a hash match; without this seed, an owner whose files were all
   // deleted but whose manifest survived would see no collision at all and
   // proceed without --force.
@@ -853,7 +861,6 @@ function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, for
 }
 
 function installSkillGroup({
-  group,
   targetDir,
   existed,
   finalHarnesses,
@@ -1024,7 +1031,6 @@ export function install(options = {}) {
   for (const { group, existed, finalHarnesses } of skillPreflight) {
     installedPaths.push(
       ...installSkillGroup({
-        group,
         targetDir: group.targetDir,
         existed,
         finalHarnesses,

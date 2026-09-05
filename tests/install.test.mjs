@@ -565,12 +565,12 @@ test("refuses an unmanaged agent file collision even with force", (t) => {
   );
 });
 
-// Gap 1: manifest association is not validated. A manifest that is
-// shape-valid (right types, right schema version) but was copied or forged
-// from another skill or another physical harness group must not be treated
-// as proof of ownership over *this* target -- not even with --force. These
-// tests hand-craft such a manifest directly (no `install()` call produced
-// it) to prove the installer authenticates *context*, not just shape.
+// A manifest that is shape-valid (right types, right schema version) but was
+// copied or forged from another skill or another physical harness group must
+// not be treated as proof of ownership over *this* target -- not even with
+// --force. These tests hand-craft such a manifest directly (no `install()`
+// call produced it) to prove the installer authenticates *context*, not just
+// shape.
 test("refuses a skill-install manifest whose skill or harnesses don't match this target, even with force, without mutating anything", (t) => {
   const projectRoot = withFixture(t);
   const fileContent = "forged skill md\n";
@@ -826,8 +826,8 @@ test("force update removes a stale owned agent file, preserves unrelated files, 
   );
 });
 
-// Gap 2: no-force partial-owned agent install. If the skill directory and
-// every owned agent payload file are removed by hand but the valid,
+// If the skill directory and every owned agent payload file are removed by
+// hand but the valid,
 // correctly-scoped agent manifest survives, that manifest alone still
 // proves a prior install happened here -- so a reinstall without --force
 // must refuse exactly as it would if the files were still present, and
@@ -932,8 +932,8 @@ test("invalid source (symlinked skill file) leaves home unmodified", (t) => {
   rmSync(externalFile, { recursive: true, force: true });
 });
 
-// Gap 3: generated-agent source directory symlink. `validateGeneratedAgents`
-// lstat-checks the final generated agent *files* but never checked whether
+// `validateGeneratedAgents` lstat-checks the final generated agent *files*
+// and must also check whether
 // the directory that contains them is itself a symlink. If
 // `<projectRoot>/generated/claude/agents` is replaced with a directory
 // symlink pointing outside the project root, every per-file lstat/hash
