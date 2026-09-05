@@ -31,7 +31,7 @@ all of the following hold:
 1. Every configured model reviewer has independently covered all six dimensions, through its primary agent or a
    configured fallback (see `references/review-loop.md`).
 2. No actionable findings remain (`evaluateRound` reports `converged` and
-   `publicationReady: true` for a current final-phase snapshot below the cap).
+   `publicationReady: true` for a current final-phase snapshot within the inclusive cap).
 3. Final validation has been run against the last code or documentation change and
    passed.
 4. Impact-based documentation updates required by this change are already made.
@@ -40,7 +40,9 @@ all of the following hold:
 
 1. Converge implementation review, then update materially affected documentation.
 2. Run final validation and a final fresh full-model-panel review of the documented
-   state. Keep the same round budget; incomplete or capped runs never publish.
+   state. Keep the same round budget. A complete clean final review at the cap may
+   publish once all gates pass; actionable or incomplete results at the cap block
+   publication and any next round.
 3. Re-evaluate the current state before staging only task-owned changes. Create
    focused commits describing the change; verify hooks did not change the content.
 4. Push the feature branch without force.

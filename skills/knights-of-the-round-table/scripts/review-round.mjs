@@ -83,8 +83,8 @@ export function evaluateRound(round, context) {
   });
   const missingReviewers = panel.map(r => r.id).filter(id => !completed.has(id)).sort(cmp);
   const state = missingReviewers.length ? "incomplete" :
-    round.round >= context.config.maxReviewRounds ? "limit-reached" :
-      actionable.length ? "actionable" : "converged";
+    !actionable.length ? "converged" :
+      round.round >= context.config.maxReviewRounds ? "limit-reached" : "actionable";
   return {
     state, actionable, missingReviewers,
     executions: executions.sort((a, b) => cmp(a.reviewer, b.reviewer)),

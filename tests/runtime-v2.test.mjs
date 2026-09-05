@@ -36,14 +36,55 @@ test("requires the entire configured panel even if the report omits reviewers", 
   data.requiredReviewers = [data.results[0].reviewer];
   assert.throws(() => runtime.evaluateRound(data, ctx), /unknown.*requiredReviewers/);
 });
-test("implementation convergence is not publication readiness; cap always blocks", () => {
+test("implementation convergence is not publication readiness", () => {
   const ctx = context(), data = round(ctx);
   assert.equal(runtime.evaluateRound(data, ctx).publicationReady, false);
   data.phase = "final";
   assert.equal(runtime.evaluateRound(data, ctx).publicationReady, true);
-  data.round = ctx.config.maxReviewRounds;
-  assert.equal(runtime.evaluateRound(data, ctx).state, "limit-reached");
-  assert.equal(runtime.evaluateRound(data, ctx).publicationReady, false);
+});
+for (const cap of [1, 2, 10]) {
+  for (const phase of ["implementation", "final"]) {
+    test(`clean ${phase} round ${cap} converges at inclusive cap ${cap}`, () => {
+      const ctx = context(); ctx.config.maxReviewRounds = cap;
+      const data = round(ctx, phase); data.round = cap;
+      const result = runtime.evaluateRound(data, ctx);
+      assert.equal(result.state, "converged");
+      assert.equal(result.publicationReady, phase === "final");
+      assert.deepEqual(result.actionable, []);
+      assert.deepEqual(result.missingReviewers, []);
+    });
+  }
+}
+test("clean final round 11 is rejected with cap 10", () => {
+  const ctx = context(), data = round(ctx, "final");
+  assert.equal(ctx.config.maxReviewRounds, 10);
+  data.round = 11;
+  assert.throws(() => runtime.evaluateRound(data, ctx), /round must be within configured maxReviewRounds/);
+});
+test("actionable final round 10 reaches cap 10 rather than allowing another round", () => {
+  const ctx = context(), data = round(ctx, "final");
+  assert.equal(ctx.config.maxReviewRounds, 10);
+  data.results[0].findings = [finding({})];
+  for (const [number, state] of [[9, "actionable"], [10, "limit-reached"]]) {
+    data.round = number;
+    const result = runtime.evaluateRound(data, ctx);
+    assert.equal(result.state, state);
+    assert.equal(result.publicationReady, false);
+    assert.equal(result.actionable.length, 1);
+  }
+});
+test("missing, failed and skipped reviewers still block a clean final round at the cap", () => {
+  const ctx = context();
+  for (const status of ["missing", "failed", "skipped"]) {
+    const data = round(ctx, "final"); data.round = ctx.config.maxReviewRounds;
+    const reviewer = data.results[0].reviewer;
+    if (status === "missing") data.results.shift();
+    else data.results[0].status = status;
+    const result = runtime.evaluateRound(data, ctx);
+    assert.equal(result.state, "incomplete");
+    assert.equal(result.publicationReady, false);
+    assert.deepEqual(result.missingReviewers, [reviewer]);
+  }
 });
 test("rejects stale snapshot, config, requested model, execution identity and incomplete coverage", () => {
   const ctx = context();
@@ -57,8 +98,10 @@ test("rejects stale snapshot, config, requested model, execution identity and in
     r => r.results[0].coverage.pop(),
     r => r.results[0].coverage.push("correctness"),
   ]) {
-    const data = round(ctx); mutate(data);
-    assert.throws(() => runtime.evaluateRound(data, ctx));
+    for (const number of [1, ctx.config.maxReviewRounds]) {
+      const data = round(ctx, "final"); data.round = number; mutate(data);
+      assert.throws(() => runtime.evaluateRound(data, ctx));
+    }
   }
 });
 test("fallback is configured, attributed and requires a reason", () => {
@@ -132,17 +175,19 @@ test("snapshot includes explicit ignored task artifacts and rejects paths escapi
   symlinkSync(tmpdir(), join(root, "escape"));
   assert.throws(() => runtime.createSnapshot(root, { artifacts: ["escape/a"] }));
 });
-test("CLI evaluation recomputes current state rather than trusting the saved snapshot", t => {
+test("CLI accepts a clean final round at the cap but rejects its snapshot after changes", t => {
   const { root } = repository(t);
   const script = new URL("../skills/knights-of-the-round-table/scripts/review-round.mjs", import.meta.url).pathname;
   const ctx = context(); ctx.snapshot = runtime.createSnapshot(root);
   const data = round(ctx, "final");
+  data.round = ctx.config.maxReviewRounds;
   const out = mkdtempSync(join(tmpdir(), "knights-round-"));
   t.after(() => rmSync(out, { recursive: true, force: true }));
   writeFileSync(join(out, "round.json"), JSON.stringify(data));
   const args = [script, "evaluate", join(out, "round.json"), "--repo", root, "--harness", "copilot", "--mode", "plugin", "--plugin-name", ctx.pluginName];
   const fresh = spawnSync(process.execPath, args, { encoding: "utf8" });
   assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(JSON.parse(fresh.stdout).publicationReady, true);
   writeFileSync(join(root, "new-artifact"), "not reviewed");
   const stale = spawnSync(process.execPath, args, { encoding: "utf8" });
   assert.equal(stale.status, 1);
