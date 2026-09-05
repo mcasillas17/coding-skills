@@ -1,0 +1,56 @@
+version: 1
+maxReviewRounds: 10
+reviewerRetryCount: 1
+documentationPolicy: impact-based
+taskSources:
+  - inline-prompt
+  - local-file
+reviewers:
+  - role: correctness
+    prompt: reviewers/correctness.md
+    fallbackRole: null
+    harnesses:
+      claude: correctness-reviewer
+      copilot: correctness-reviewer
+      codex: correctness-reviewer
+      gemini: correctness-reviewer
+  - role: tests
+    prompt: reviewers/tests.md
+    fallbackRole: correctness
+    harnesses:
+      claude: tests-reviewer
+      copilot: tests-reviewer
+      codex: tests-reviewer
+      gemini: tests-reviewer
+  - role: security
+    prompt: reviewers/security.md
+    fallbackRole: correctness
+    harnesses:
+      claude: security-reviewer
+      copilot: security-reviewer
+      codex: security-reviewer
+      gemini: security-reviewer
+  - role: documentation
+    prompt: reviewers/documentation.md
+    fallbackRole: correctness
+    harnesses:
+      claude: documentation-reviewer
+      copilot: documentation-reviewer
+      codex: documentation-reviewer
+      gemini: documentation-reviewer
+  - role: architecture
+    prompt: reviewers/architecture.md
+    fallbackRole: correctness
+    harnesses:
+      claude: architecture-reviewer
+      copilot: architecture-reviewer
+      codex: architecture-reviewer
+      gemini: architecture-reviewer
+  - role: performance
+    prompt: reviewers/performance.md
+    fallbackRole: architecture
+    harnesses:
+      claude: performance-reviewer
+      copilot: performance-reviewer
+      codex: performance-reviewer
+      gemini: performance-reviewer
