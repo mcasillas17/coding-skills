@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -74,6 +76,25 @@ function checkedInUrl(harness, relativePath) {
     `../${harnessDirectories[harness]}/${relativePath}`,
     import.meta.url,
   );
+}
+
+function checkedInGeneratedSnapshot() {
+  const rendered = renderAll();
+  const snapshot = {};
+  for (const [harness, files] of Object.entries(rendered)) {
+    for (const relativePath of Object.keys(files)) {
+      const ownedPath = `${harnessDirectories[harness]}/${relativePath}`;
+      snapshot[ownedPath] = readFileSync(
+        checkedInUrl(harness, relativePath),
+        "utf8",
+      );
+    }
+  }
+  snapshot[".generated-agents.json"] = readFileSync(
+    new URL("../.generated-agents.json", import.meta.url),
+    "utf8",
+  );
+  return snapshot;
 }
 
 function runRenderer(...args) {
@@ -329,6 +350,188 @@ test("renderer preserves unowned agent files and records generated ownership", (
     });
   } finally {
     removeRendererProject(projectRoot);
+  }
+});
+
+test("renderer rejects a symlinked output file before modifying any targets", () => {
+  const projectRoot = createRendererProject();
+  const externalRoot = mkdtempSync(
+    join(tmpdir(), "reviewer-renderer-external-"),
+  );
+  const externalPath = join(externalRoot, "outside.agent.md");
+  const linkedPath = join(
+    projectRoot,
+    "agents/correctness-reviewer.agent.md",
+  );
+  const preservedPath = join(
+    projectRoot,
+    "generated/claude/agents/correctness-reviewer.md",
+  );
+  const checkedInBefore = checkedInGeneratedSnapshot();
+  mkdirSync(join(projectRoot, "agents"), { recursive: true });
+  mkdirSync(join(projectRoot, "generated/claude/agents"), {
+    recursive: true,
+  });
+  writeFileSync(externalPath, "External target.");
+  writeFileSync(preservedPath, "Preserve existing output.");
+  symlinkSync(externalPath, linkedPath);
+
+  try {
+    assert.throws(
+      () =>
+        renderer.synchronizeGeneratedAgents({
+          projectRoot,
+          config: validConfig(),
+        }),
+      /generated output target must not be a symlink: agents\/correctness-reviewer\.agent\.md/i,
+    );
+    assert.equal(readFileSync(externalPath, "utf8"), "External target.");
+    assert.equal(readFileSync(preservedPath, "utf8"), "Preserve existing output.");
+    assert.equal(lstatSync(linkedPath).isSymbolicLink(), true);
+    assert.deepEqual(checkedInGeneratedSnapshot(), checkedInBefore);
+  } finally {
+    removeRendererProject(projectRoot);
+    removeRendererProject(externalRoot);
+  }
+});
+
+test("renderer rejects non-regular output targets before modifying files", () => {
+  const projectRoot = createRendererProject();
+  const targetPath = join(
+    projectRoot,
+    "agents/correctness-reviewer.agent.md",
+  );
+  const earlierPath = join(
+    projectRoot,
+    "generated/claude/agents/correctness-reviewer.md",
+  );
+  mkdirSync(targetPath, { recursive: true });
+
+  try {
+    assert.throws(
+      () =>
+        renderer.synchronizeGeneratedAgents({
+          projectRoot,
+          config: validConfig(),
+        }),
+      /generated output target must be a regular file: agents\/correctness-reviewer\.agent\.md/i,
+    );
+    assert.equal(existsSync(earlierPath), false);
+    assert.equal(lstatSync(targetPath).isDirectory(), true);
+  } finally {
+    removeRendererProject(projectRoot);
+  }
+});
+
+test("renderer rejects a symlinked harness directory before modifying any targets", () => {
+  const projectRoot = createRendererProject();
+  const externalRoot = mkdtempSync(
+    join(tmpdir(), "reviewer-renderer-external-"),
+  );
+  const externalSentinel = join(externalRoot, "sentinel.txt");
+  const externalOutput = join(
+    externalRoot,
+    "correctness-reviewer.agent.md",
+  );
+  const earlierPath = join(
+    projectRoot,
+    "generated/claude/agents/correctness-reviewer.md",
+  );
+  const checkedInBefore = checkedInGeneratedSnapshot();
+  writeFileSync(externalSentinel, "External directory.");
+  symlinkSync(externalRoot, join(projectRoot, "agents"), "dir");
+
+  try {
+    assert.throws(
+      () =>
+        renderer.synchronizeGeneratedAgents({
+          projectRoot,
+          config: validConfig(),
+        }),
+      /harness output directory must not be a symlink: agents/i,
+    );
+    assert.equal(readFileSync(externalSentinel, "utf8"), "External directory.");
+    assert.equal(existsSync(externalOutput), false);
+    assert.equal(existsSync(earlierPath), false);
+    assert.deepEqual(checkedInGeneratedSnapshot(), checkedInBefore);
+  } finally {
+    removeRendererProject(projectRoot);
+    removeRendererProject(externalRoot);
+  }
+});
+
+test("renderer rejects a symlinked ownership manifest before reading targets", () => {
+  const projectRoot = createRendererProject();
+  const externalRoot = mkdtempSync(
+    join(tmpdir(), "reviewer-renderer-external-"),
+  );
+  const externalSentinel = join(externalRoot, "sentinel.txt");
+  const earlierPath = join(
+    projectRoot,
+    "generated/claude/agents/correctness-reviewer.md",
+  );
+  const checkedInBefore = checkedInGeneratedSnapshot();
+  writeFileSync(externalSentinel, "External directory.");
+  symlinkSync(externalRoot, join(projectRoot, ".generated-agents.json"), "dir");
+
+  try {
+    assert.throws(
+      () =>
+        renderer.synchronizeGeneratedAgents({
+          projectRoot,
+          config: validConfig(),
+        }),
+      /ownership manifest target must not be a symlink: \.generated-agents\.json/i,
+    );
+    assert.equal(readFileSync(externalSentinel, "utf8"), "External directory.");
+    assert.deepEqual(readdirSync(externalRoot), ["sentinel.txt"]);
+    assert.equal(existsSync(earlierPath), false);
+    assert.deepEqual(checkedInGeneratedSnapshot(), checkedInBefore);
+  } finally {
+    removeRendererProject(projectRoot);
+    removeRendererProject(externalRoot);
+  }
+});
+
+test("renderer safely removes an owned stale symlink without touching its target", () => {
+  const projectRoot = createRendererProject();
+  const externalRoot = mkdtempSync(
+    join(tmpdir(), "reviewer-renderer-external-"),
+  );
+  const externalPath = join(externalRoot, "outside.agent.md");
+  const stalePath = join(projectRoot, "agents/stale.agent.md");
+  mkdirSync(join(projectRoot, "agents"), { recursive: true });
+  writeFileSync(externalPath, "External target.");
+  symlinkSync(externalPath, stalePath);
+  writeFileSync(
+    join(projectRoot, ".generated-agents.json"),
+    `${JSON.stringify(
+      { version: 1, files: ["agents/stale.agent.md"] },
+      null,
+      2,
+    )}\n`,
+  );
+
+  try {
+    renderer.synchronizeGeneratedAgents({
+      projectRoot,
+      config: validConfig(),
+    });
+
+    assert.equal(existsSync(stalePath), false);
+    assert.equal(readFileSync(externalPath, "utf8"), "External target.");
+    const manifest = JSON.parse(
+      readFileSync(join(projectRoot, ".generated-agents.json"), "utf8"),
+    );
+    assert.deepEqual(manifest.files, [
+      "agents/correctness-reviewer.agent.md",
+      "generated/claude/agents/correctness-reviewer.md",
+      "generated/codex/agents/correctness-reviewer.toml",
+      "generated/gemini/agents/correctness-reviewer.md",
+    ]);
+  } finally {
+    removeRendererProject(projectRoot);
+    removeRendererProject(externalRoot);
   }
 });
 

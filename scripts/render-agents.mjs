@@ -1,11 +1,12 @@
 import {
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
@@ -69,6 +70,47 @@ const renderers = {
 
 function toPosixPath(path) {
   return path.split(sep).join("/");
+}
+
+function lstatIfExists(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isContainedPath(root, path) {
+  const relativePath = relative(root, path);
+  return (
+    relativePath === "" ||
+    (relativePath !== ".." &&
+      !relativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(relativePath))
+  );
+}
+
+function assertRealPathContained(realProjectRoot, path, description) {
+  const realPath = realpathSync(path);
+  if (!isContainedPath(realProjectRoot, realPath)) {
+    throw new Error(`${description} resolves outside repository`);
+  }
+  return realPath;
+}
+
+function nearestExistingPath(path) {
+  let currentPath = path;
+  while (lstatIfExists(currentPath) === null) {
+    const parentPath = dirname(currentPath);
+    if (parentPath === currentPath) {
+      throw new Error(`Unable to find existing parent for ${path}`);
+    }
+    currentPath = parentPath;
+  }
+  return currentPath;
 }
 
 function loadConfig(projectRoot) {
@@ -205,6 +247,119 @@ function serializeManifest(files) {
   return `${JSON.stringify({ version: 1, files }, null, 2)}\n`;
 }
 
+function assertDirectoryParentContained(
+  projectRoot,
+  realProjectRoot,
+  directory,
+  description,
+) {
+  if (!isContainedPath(projectRoot, directory)) {
+    throw new Error(`${description} escapes repository`);
+  }
+
+  const existingPath = nearestExistingPath(directory);
+  const realExistingPath = assertRealPathContained(
+    realProjectRoot,
+    existingPath,
+    description,
+  );
+  if (!lstatSync(realExistingPath).isDirectory()) {
+    throw new Error(`${description} parent must be a directory`);
+  }
+}
+
+function assertHarnessDirectorySafe(
+  projectRoot,
+  realProjectRoot,
+  harness,
+) {
+  const relativeDirectory = HARNESS_DIRECTORIES[harness];
+  const directory = resolve(projectRoot, relativeDirectory);
+  const stats = lstatIfExists(directory);
+
+  if (stats?.isSymbolicLink()) {
+    throw new Error(
+      `Harness output directory must not be a symlink: ${relativeDirectory}`,
+    );
+  }
+  if (stats !== null && !stats.isDirectory()) {
+    throw new Error(
+      `Harness output directory must be a directory: ${relativeDirectory}`,
+    );
+  }
+
+  assertDirectoryParentContained(
+    projectRoot,
+    realProjectRoot,
+    directory,
+    `Harness output directory ${relativeDirectory}`,
+  );
+}
+
+function assertWritableFileTarget(
+  projectRoot,
+  realProjectRoot,
+  path,
+  description,
+  relativePath,
+) {
+  if (!isContainedPath(projectRoot, path)) {
+    throw new Error(`${description} escapes repository: ${relativePath}`);
+  }
+
+  assertDirectoryParentContained(
+    projectRoot,
+    realProjectRoot,
+    dirname(path),
+    `${description} ${relativePath}`,
+  );
+
+  const stats = lstatIfExists(path);
+  if (stats?.isSymbolicLink()) {
+    throw new Error(`${description} must not be a symlink: ${relativePath}`);
+  }
+  if (stats !== null && !stats.isFile()) {
+    throw new Error(`${description} must be a regular file: ${relativePath}`);
+  }
+  if (stats !== null) {
+    assertRealPathContained(
+      realProjectRoot,
+      path,
+      `${description} ${relativePath}`,
+    );
+  }
+}
+
+function assertDeletableOwnedTarget(
+  projectRoot,
+  realProjectRoot,
+  path,
+  description,
+) {
+  if (!isContainedPath(projectRoot, path)) {
+    throw new Error(`${description} escapes repository`);
+  }
+
+  assertDirectoryParentContained(
+    projectRoot,
+    realProjectRoot,
+    dirname(path),
+    description,
+  );
+
+  const stats = lstatIfExists(path);
+  if (
+    stats !== null &&
+    !stats.isFile() &&
+    !stats.isSymbolicLink()
+  ) {
+    throw new Error(`${description} must be a regular file or symlink`);
+  }
+  if (stats?.isFile()) {
+    assertRealPathContained(realProjectRoot, path, description);
+  }
+}
+
 function loadOwnershipManifest(projectRoot) {
   let contents;
   try {
@@ -287,6 +442,60 @@ function findDrift(projectRoot, rendered, manifest) {
   return [...new Set(drift)].sort();
 }
 
+function assertOutputPathsSafe(projectRoot, rendered) {
+  const resolvedProjectRoot = resolve(projectRoot);
+  const realProjectRoot = realpathSync(resolvedProjectRoot);
+  if (!lstatSync(realProjectRoot).isDirectory()) {
+    throw new Error("Project root must be a directory");
+  }
+
+  for (const [harness, files] of Object.entries(rendered)) {
+    assertHarnessDirectorySafe(
+      resolvedProjectRoot,
+      realProjectRoot,
+      harness,
+    );
+    for (const relativePath of Object.keys(files)) {
+      assertWritableFileTarget(
+        resolvedProjectRoot,
+        realProjectRoot,
+        generatedPath(resolvedProjectRoot, harness, relativePath),
+        "Generated output target",
+        `${HARNESS_DIRECTORIES[harness]}/${relativePath}`,
+      );
+    }
+  }
+
+  assertWritableFileTarget(
+    resolvedProjectRoot,
+    realProjectRoot,
+    ownershipManifestPath(resolvedProjectRoot),
+    "Ownership manifest target",
+    MANIFEST_FILENAME,
+  );
+
+  return { resolvedProjectRoot, realProjectRoot };
+}
+
+function assertOwnedDeletionPathsSafe(
+  resolvedProjectRoot,
+  realProjectRoot,
+  rendered,
+  manifest,
+) {
+  const expectedFileSet = new Set(expectedOwnedPaths(rendered));
+  for (const ownedPath of manifest.files) {
+    if (!expectedFileSet.has(ownedPath)) {
+      assertDeletableOwnedTarget(
+        resolvedProjectRoot,
+        realProjectRoot,
+        ownedOutputPath(resolvedProjectRoot, ownedPath),
+        `Owned generated output ${ownedPath}`,
+      );
+    }
+  }
+}
+
 function synchronizeOwnedOutputs(projectRoot, rendered, manifest) {
   const expectedFiles = expectedOwnedPaths(rendered);
   const expectedFileSet = new Set(expectedFiles);
@@ -321,6 +530,10 @@ export function synchronizeGeneratedAgents(options = {}) {
     config: options.config,
     prompts: options.prompts,
   });
+  const { resolvedProjectRoot, realProjectRoot } = assertOutputPathsSafe(
+    projectRoot,
+    rendered,
+  );
   const manifest = loadOwnershipManifest(projectRoot);
   const drift = findDrift(projectRoot, rendered, manifest);
   const fileCount = Object.values(rendered).reduce(
@@ -329,6 +542,12 @@ export function synchronizeGeneratedAgents(options = {}) {
   );
 
   if (!options.check) {
+    assertOwnedDeletionPathsSafe(
+      resolvedProjectRoot,
+      realProjectRoot,
+      rendered,
+      manifest,
+    );
     synchronizeOwnedOutputs(projectRoot, rendered, manifest);
   }
 
