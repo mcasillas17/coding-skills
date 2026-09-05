@@ -195,9 +195,17 @@ function collectErrors(round) {
           });
         }
       } else if (Object.hasOwn(result, "findings")) {
-        errors.push(
-          `${label}.findings must be omitted unless status is completed`,
-        );
+        if (!Array.isArray(result.findings)) {
+          errors.push(`${label}.findings must be an array when present`);
+        } else {
+          result.findings.forEach((finding, findingIndex) => {
+            validateFinding(
+              finding,
+              `${label}.findings[${findingIndex}]`,
+              errors,
+            );
+          });
+        }
       }
     });
   }

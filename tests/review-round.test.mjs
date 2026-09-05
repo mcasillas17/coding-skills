@@ -225,6 +225,44 @@ test("rejects results that are not an array", () => {
   );
 });
 
+test("rejects a result entry that is not a mapping", () => {
+  for (const invalid of ["correctness", 1, null, [], undefined]) {
+    assert.throws(
+      () =>
+        evaluateRound(
+          baseRound({
+            results: [
+              invalid,
+              ...REQUIRED_REVIEWERS.slice(1).map((reviewer) =>
+                completed(reviewer),
+              ),
+            ],
+          }),
+        ),
+      /results\[0\] must be a mapping/,
+      `expected rejection for result entry ${JSON.stringify(invalid)}`,
+    );
+  }
+});
+
+test("rejects a result with an empty, whitespace-only, or non-string reviewer", () => {
+  for (const reviewer of ["", "   ", 123, null, undefined]) {
+    assert.throws(
+      () =>
+        evaluateRound(
+          baseRound({
+            results: [
+              { reviewer, status: "completed", findings: [] },
+              ...REQUIRED_REVIEWERS.slice(1).map((r) => completed(r)),
+            ],
+          }),
+        ),
+      /results\[0\]\.reviewer must be a non-empty string/,
+      `expected rejection for reviewer ${JSON.stringify(reviewer)}`,
+    );
+  }
+});
+
 test("rejects a result with unknown keys or an unrecognized reviewer", () => {
   assert.throws(
     () =>
@@ -292,7 +330,7 @@ test("rejects an unrecognized result status", () => {
   );
 });
 
-test("requires a findings array only for completed results", () => {
+test("requires a findings array for completed results", () => {
   assert.throws(
     () =>
       evaluateRound(
@@ -307,20 +345,76 @@ test("requires a findings array only for completed results", () => {
       ),
     /results\[0\]\.findings must be an array for a completed result/,
   );
+});
 
+test("allows a non-completed result to omit findings entirely", () => {
+  const round = baseRound({
+    results: [
+      { reviewer: "correctness", status: "failed" },
+      { reviewer: "tests", status: "skipped" },
+      ...REQUIRED_REVIEWERS.slice(2).map((reviewer) => completed(reviewer)),
+    ],
+  });
+
+  const result = evaluateRound(round);
+  assert.equal(result.state, "incomplete");
+  assert.deepEqual(result.missingReviewers, ["correctness", "tests"]);
+});
+
+test("allows a non-completed result to include a valid findings array without it becoming actionable", () => {
+  const round = baseRound({
+    results: [
+      { reviewer: "correctness", status: "failed", findings: [] },
+      {
+        reviewer: "tests",
+        status: "skipped",
+        findings: [finding({ id: "finding:never-actionable" })],
+      },
+      ...REQUIRED_REVIEWERS.slice(2).map((reviewer) => completed(reviewer)),
+    ],
+  });
+
+  const result = evaluateRound(round);
+  assert.equal(result.state, "incomplete");
+  assert.deepEqual(result.missingReviewers, ["correctness", "tests"]);
+  assert.deepEqual(result.actionable, []);
+});
+
+test("rejects a non-completed result whose findings is present but not an array", () => {
   assert.throws(
     () =>
       evaluateRound(
         baseRound({
           results: [
-            { reviewer: "correctness", status: "failed", findings: [] },
+            { reviewer: "correctness", status: "failed", findings: "oops" },
             ...REQUIRED_REVIEWERS.slice(1).map((reviewer) =>
               completed(reviewer),
             ),
           ],
         }),
       ),
-    /results\[0\]\.findings must be omitted unless status is completed/,
+    /results\[0\]\.findings must be an array when present/,
+  );
+});
+
+test("validates findings on a non-completed result the same way as a completed result", () => {
+  assert.throws(
+    () =>
+      evaluateRound(
+        baseRound({
+          results: [
+            {
+              reviewer: "correctness",
+              status: "skipped",
+              findings: ["not-an-object"],
+            },
+            ...REQUIRED_REVIEWERS.slice(1).map((reviewer) =>
+              completed(reviewer),
+            ),
+          ],
+        }),
+      ),
+    /results\[0\]\.findings\[0\] must be a mapping/,
   );
 });
 
