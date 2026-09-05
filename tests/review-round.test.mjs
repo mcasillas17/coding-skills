@@ -4,10 +4,12 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { evaluateRound } from "../scripts/review-round.mjs";
@@ -626,4 +628,111 @@ test("CLI exits 3 when the argument count is wrong", () => {
   );
   assert.equal(extraArg.status, 3);
   assert.equal(extraArg.stdout, "");
+});
+
+test("CLI runs correctly when invoked through a symlinked script path", () => {
+  const directory = mkdtempSync(join(tmpdir(), "review-round-symlink-"));
+  const roundPath = join(directory, "round.json");
+  writeFileSync(roundPath, JSON.stringify(fixture("converged")));
+  const realScriptPath = fileURLToPath(
+    new URL("../scripts/review-round.mjs", import.meta.url),
+  );
+  const linkPath = join(directory, "review-round-link.mjs");
+  symlinkSync(realScriptPath, linkPath);
+
+  try {
+    const result = spawnSync(process.execPath, [linkPath, roundPath], {
+      cwd: new URL("..", import.meta.url),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      state: "converged",
+      actionable: [],
+      missingReviewers: [],
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI runs correctly when invoked through a symlinked parent directory", () => {
+  const directory = mkdtempSync(join(tmpdir(), "review-round-symlink-dir-"));
+  const roundPath = join(directory, "round.json");
+  writeFileSync(roundPath, JSON.stringify(fixture("converged")));
+  const realScriptsDir = fileURLToPath(new URL("../scripts", import.meta.url));
+  const linkedDir = join(directory, "scripts-link");
+  symlinkSync(realScriptsDir, linkedDir, "dir");
+  const scriptViaLink = join(linkedDir, "review-round.mjs");
+
+  try {
+    const result = spawnSync(process.execPath, [scriptViaLink, roundPath], {
+      cwd: new URL("..", import.meta.url),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      state: "converged",
+      actionable: [],
+      missingReviewers: [],
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("emits actionable findings with identical serialization regardless of duplicate key order or result order", () => {
+  const FORWARD_ORDER = [
+    "id",
+    "severity",
+    "confidence",
+    "file",
+    "line",
+    "title",
+    "evidence",
+    "recommendation",
+    "status",
+  ];
+  const REVERSE_ORDER = [...FORWARD_ORDER].reverse();
+  const values = {
+    id: "finding:dup",
+    severity: "medium",
+    confidence: 5,
+    file: "scripts/example.mjs",
+    line: 1,
+    title: "Example finding",
+    evidence: "Concrete evidence",
+    recommendation: "Specific actionable fix",
+    status: "open",
+  };
+
+  function findingWithOrder(order) {
+    const object = {};
+    for (const key of order) {
+      object[key] = values[key];
+    }
+    return object;
+  }
+
+  const resultsForward = REQUIRED_REVIEWERS.map((reviewer, index) =>
+    completed(reviewer, [
+      findingWithOrder(index % 2 === 0 ? FORWARD_ORDER : REVERSE_ORDER),
+    ]),
+  );
+  const resultsBackward = resultsForward
+    .slice()
+    .reverse()
+    .map((result, index) => ({
+      ...result,
+      findings: [
+        findingWithOrder(index % 2 === 0 ? REVERSE_ORDER : FORWARD_ORDER),
+      ],
+    }));
+
+  const forward = evaluateRound(baseRound({ results: resultsForward }));
+  const backward = evaluateRound(baseRound({ results: resultsBackward }));
+
+  assert.deepEqual(Object.keys(forward.actionable[0]), FORWARD_ORDER);
+  assert.deepEqual(Object.keys(backward.actionable[0]), FORWARD_ORDER);
+  assert.equal(JSON.stringify(forward), JSON.stringify(backward));
 });

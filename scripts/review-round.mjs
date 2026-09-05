@@ -1,11 +1,10 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const TOP_LEVEL_KEYS = ["round", "maxRounds", "requiredReviewers", "results"];
 const RESULT_KEYS = new Set(["reviewer", "status", "findings"]);
 const RESULT_STATUSES = new Set(["completed", "failed", "skipped"]);
-const FINDING_KEYS = new Set([
+const FINDING_FIELD_ORDER = [
   "id",
   "severity",
   "confidence",
@@ -15,7 +14,8 @@ const FINDING_KEYS = new Set([
   "evidence",
   "recommendation",
   "status",
-]);
+];
+const FINDING_KEYS = new Set(FINDING_FIELD_ORDER);
 const SEVERITIES = new Set(["critical", "high", "medium", "low"]);
 const FINDING_STATUSES = new Set(["open"]);
 
@@ -29,6 +29,14 @@ function isNonEmptyString(value) {
 
 function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0;
+}
+
+function canonicalizeFinding(finding) {
+  const canonical = {};
+  for (const key of FINDING_FIELD_ORDER) {
+    canonical[key] = finding[key];
+  }
+  return canonical;
 }
 
 function deepEqual(a, b) {
@@ -232,7 +240,8 @@ export function evaluateRound(round) {
 
   const findingsById = new Map();
   for (const result of completedResults) {
-    for (const finding of result.findings) {
+    for (const rawFinding of result.findings) {
+      const finding = canonicalizeFinding(rawFinding);
       const existing = findingsById.get(finding.id);
       if (existing === undefined) {
         findingsById.set(finding.id, finding);
@@ -308,9 +317,27 @@ function runCli() {
   process.exitCode = exitCodeFor(result.state);
 }
 
-const isMain =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+function realpathOrNull(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+
+function isMainModule() {
+  if (process.argv[1] === undefined) {
+    return false;
+  }
+  const invokedRealPath = realpathOrNull(process.argv[1]);
+  const moduleRealPath = realpathOrNull(fileURLToPath(import.meta.url));
+  return (
+    invokedRealPath !== null &&
+    moduleRealPath !== null &&
+    invokedRealPath === moduleRealPath
+  );
+}
+
+if (isMainModule()) {
   runCli();
 }
