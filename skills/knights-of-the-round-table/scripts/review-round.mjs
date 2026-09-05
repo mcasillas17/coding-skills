@@ -1,369 +1,135 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { assertValidConfig, DIMENSIONS, isSafeRelativePath, loadEffectiveConfig } from "./validate-config.mjs";
+import { configDigest, createSnapshot, stableJson } from "./snapshot.mjs";
+import { preflight, resolvePanel } from "./harness.mjs";
+export { configDigest, createSnapshot, preflight, resolvePanel };
 
-function realpathOrNull(path) {
-  try {
-    return realpathSync(path);
-  } catch {
-    return null;
+const mapping = value => value !== null && typeof value === "object" && !Array.isArray(value);
+const text = value => typeof value === "string" && value.trim() !== "";
+const hash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const positive = value => Number.isSafeInteger(value) && value > 0;
+const severity = { critical: 4, high: 3, medium: 2, low: 1 };
+const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+function requireValue(condition, message) { if (!condition) throw new Error(message); }
+function keys(value, allowed, label) {
+  requireValue(mapping(value), `${label} must be a mapping`);
+  for (const key of Object.keys(value)) requireValue(allowed.includes(key), `${label} unknown key: ${key}`);
+}
+function validateFinding(finding) {
+  keys(finding, ["id", "severity", "confidence", "file", "line", "title", "evidence", "recommendation", "status"], "finding");
+  for (const field of ["id", "title", "evidence", "recommendation"]) requireValue(text(finding[field]), `finding ${field} must be non-empty`);
+  requireValue(isSafeRelativePath(finding.file), "finding file must be a safe relative path");
+  requireValue(positive(finding.line), "finding line must be a positive integer");
+  requireValue(Object.hasOwn(severity, finding.severity), "finding severity must be critical, high, medium or low");
+  requireValue(Number.isInteger(finding.confidence) && finding.confidence >= 1 && finding.confidence <= 10, "finding confidence must be 1 through 10");
+  requireValue(finding.status === "open", "finding status must be open");
+}
+
+export function evaluateRound(round, context) {
+  requireValue(mapping(context) && mapping(context.config) && mapping(context.snapshot), "independent config and current snapshot context are required");
+  assertValidConfig(context.config);
+  requireValue(context.snapshot.version === 1 && hash(context.snapshot.digest) &&
+    text(context.snapshot.repositoryRoot) && /^[a-f0-9]{40,64}$/.test(context.snapshot.head ?? ""), "invalid current snapshot context");
+  const panel = resolvePanel(context.config, context.harness, context);
+  const required = new Map(panel.map(entry => [entry.id, entry]));
+  keys(round, ["version", "round", "phase", "configDigest", "snapshotDigest", "results"], "round");
+  requireValue(round.version === 2, "round version must be 2");
+  requireValue(positive(round.round) && round.round <= context.config.maxReviewRounds, "round must be within configured maxReviewRounds");
+  requireValue(["implementation", "final"].includes(round.phase), "phase must be implementation or final");
+  requireValue(round.configDigest === configDigest(context.config), "stale or mismatched config digest");
+  requireValue(round.snapshotDigest === context.snapshot.digest, "stale or mismatched snapshot digest");
+  requireValue(Array.isArray(round.results), "results must be an array");
+  const seen = new Set(), completed = new Set(), executions = [], groups = new Map();
+  for (const result of round.results) {
+    keys(result, ["reviewer", "status", "requestedModel", "execution", "snapshotDigest", "coverage", "findings"], "result");
+    requireValue(required.has(result.reviewer) && !seen.has(result.reviewer), `unknown or duplicate reviewer: ${result.reviewer}`);
+    seen.add(result.reviewer);
+    requireValue(["completed", "failed", "skipped"].includes(result.status), "result status must be completed, failed or skipped");
+    requireValue(result.snapshotDigest === context.snapshot.digest, "stale result snapshot digest");
+    const expected = required.get(result.reviewer);
+    requireValue(result.requestedModel === expected.model, `requested model mismatch: ${result.reviewer}`);
+    if (result.findings !== undefined) {
+      requireValue(Array.isArray(result.findings), "findings must be an array");
+      result.findings.forEach(validateFinding);
+    }
+    if (result.status !== "completed") continue;
+    requireValue(Array.isArray(result.findings), "completed result requires findings array");
+    requireValue(Array.isArray(result.coverage) && result.coverage.length === DIMENSIONS.length &&
+      DIMENSIONS.every(area => result.coverage.includes(area)), "every reviewer must cover all six dimensions exactly once");
+    keys(result.execution, ["id", "model", "reason"], "execution");
+    const match = target => target && target.invocationId === result.execution.id && target.model === result.execution.model;
+    const fallback = !match(expected);
+    requireValue(!fallback || match(expected.fallback), `execution identity/model mismatch for ${result.reviewer}`);
+    requireValue(!fallback || text(result.execution.reason), "fallback execution requires a reason");
+    if (result.execution.reason !== undefined) requireValue(text(result.execution.reason), "execution reason must be non-empty");
+    completed.add(result.reviewer);
+    executions.push({ reviewer: result.reviewer, requestedModel: expected.model, ...result.execution, fallback, coverage: [...DIMENSIONS] });
+    const findingKeys = new Set();
+    for (const finding of result.findings) {
+      // Generic IDs alone are not defect identity. Title further distinguishes
+      // independent defects reported at the same line; all raw evidence survives.
+      const identity = stableJson([finding.file, finding.line, finding.id, finding.title]);
+      requireValue(!findingKeys.has(identity), "duplicate finding identity within one reviewer result");
+      findingKeys.add(identity);
+      if (!groups.has(identity)) groups.set(identity, []);
+      groups.get(identity).push({ reviewer: result.reviewer, execution: { ...result.execution }, finding: { ...finding } });
+    }
   }
-}
-
-function isMainModule(moduleUrl, invokedPath = process.argv[1]) {
-  if (invokedPath === undefined) {
-    return false;
-  }
-
-  const invokedRealPath = realpathOrNull(invokedPath);
-  const moduleRealPath = realpathOrNull(fileURLToPath(moduleUrl));
-  return (
-    invokedRealPath !== null &&
-    moduleRealPath !== null &&
-    invokedRealPath === moduleRealPath
-  );
-}
-
-const TOP_LEVEL_KEYS = ["round", "maxRounds", "requiredReviewers", "results"];
-const RESULT_KEYS = new Set(["reviewer", "status", "findings"]);
-const RESULT_STATUSES = new Set(["completed", "failed", "skipped"]);
-const FINDING_FIELD_ORDER = [
-  "id",
-  "severity",
-  "confidence",
-  "file",
-  "line",
-  "title",
-  "evidence",
-  "recommendation",
-  "status",
-];
-const FINDING_KEYS = new Set(FINDING_FIELD_ORDER);
-const SEVERITY_PRIORITY = new Map([
-  ["critical", 4],
-  ["high", 3],
-  ["medium", 2],
-  ["low", 1],
-]);
-const SEVERITIES = new Set(SEVERITY_PRIORITY.keys());
-const FINDING_STATUSES = new Set(["open"]);
-
-function isMapping(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isNonEmptyString(value) {
-  return typeof value === "string" && value.trim() !== "";
-}
-
-function isPositiveInteger(value) {
-  return Number.isInteger(value) && value > 0;
-}
-
-function canonicalizeFinding(finding) {
-  const canonical = {};
-  for (const key of FINDING_FIELD_ORDER) {
-    canonical[key] = finding[key];
-  }
-  return canonical;
-}
-
-function compareLexically(a, b) {
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-
-function compareFindingReports(a, b) {
-  const severityDifference =
-    SEVERITY_PRIORITY.get(b.finding.severity) -
-    SEVERITY_PRIORITY.get(a.finding.severity);
-  if (severityDifference !== 0) {
-    return severityDifference;
-  }
-
-  const confidenceDifference =
-    b.finding.confidence - a.finding.confidence;
-  if (confidenceDifference !== 0) {
-    return confidenceDifference;
-  }
-
-  return compareLexically(a.reviewer, b.reviewer);
-}
-
-function createActionableFinding(report, reportedBy) {
+  const actionable = [...groups.entries()].sort(([a], [b]) => cmp(a, b)).map(([, reports]) => {
+    reports.sort((a, b) => severity[b.finding.severity] - severity[a.finding.severity] ||
+      b.finding.confidence - a.finding.confidence || cmp(a.reviewer, b.reviewer));
+    return { ...reports[0].finding, reportedBy: reports.map(r => r.reviewer).sort(cmp), reports };
+  });
+  const missingReviewers = panel.map(r => r.id).filter(id => !completed.has(id)).sort(cmp);
+  const state = missingReviewers.length ? "incomplete" :
+    round.round >= context.config.maxReviewRounds ? "limit-reached" :
+      actionable.length ? "actionable" : "converged";
   return {
-    ...report.finding,
-    reportedBy: [...reportedBy].sort(compareLexically),
+    state, actionable, missingReviewers,
+    executions: executions.sort((a, b) => cmp(a.reviewer, b.reviewer)),
+    publicationReady: state === "converged" && round.phase === "final",
   };
 }
 
-function validateFinding(finding, label, errors) {
-  if (!isMapping(finding)) {
-    errors.push(`${label} must be a mapping`);
-    return;
-  }
-
-  for (const key of Object.keys(finding)) {
-    if (!FINDING_KEYS.has(key)) {
-      errors.push(`${label} unknown key: ${key}`);
-    }
-  }
-
-  for (const field of ["id", "file", "title", "evidence", "recommendation"]) {
-    if (!isNonEmptyString(finding[field])) {
-      errors.push(`${label}.${field} must be a non-empty string`);
-    }
-  }
-
-  if (!SEVERITIES.has(finding.severity)) {
-    errors.push(`${label}.severity must be one of critical, high, medium, low`);
-  }
-
-  if (
-    !(
-      Number.isInteger(finding.confidence) &&
-      finding.confidence >= 1 &&
-      finding.confidence <= 10
-    )
-  ) {
-    errors.push(`${label}.confidence must be an integer from 1 to 10`);
-  }
-
-  if (!isPositiveInteger(finding.line)) {
-    errors.push(`${label}.line must be a positive integer`);
-  }
-
-  if (!FINDING_STATUSES.has(finding.status)) {
-    errors.push(`${label}.status must be open`);
-  }
-}
-
-function collectErrors(round) {
-  if (!isMapping(round)) {
-    return ["review round must be a mapping"];
-  }
-
-  const errors = [];
-  const roundKeys = new Set(TOP_LEVEL_KEYS);
-  for (const key of Object.keys(round)) {
-    if (!roundKeys.has(key)) {
-      errors.push(`unknown top-level key: ${key}`);
-    }
-  }
-  for (const key of TOP_LEVEL_KEYS) {
-    if (!Object.hasOwn(round, key)) {
-      errors.push(`missing required key: ${key}`);
-    }
-  }
-
-  if (!isPositiveInteger(round.maxRounds)) {
-    errors.push("maxRounds must be a positive integer");
-  } else if (round.maxRounds > 10) {
-    errors.push("maxRounds must be at most 10");
-  }
-  if (!isPositiveInteger(round.round)) {
-    errors.push("round must be a positive integer");
-  } else if (isPositiveInteger(round.maxRounds) && round.round > round.maxRounds) {
-    errors.push("round must not exceed maxRounds");
-  }
-
-  let knownReviewers = new Set();
-  if (!Array.isArray(round.requiredReviewers) || round.requiredReviewers.length === 0) {
-    errors.push("requiredReviewers must be a non-empty array");
-  } else {
-    const seen = new Set();
-    round.requiredReviewers.forEach((reviewer, index) => {
-      const label = `requiredReviewers[${index}]`;
-      if (!isNonEmptyString(reviewer)) {
-        errors.push(`${label} must be a non-empty string`);
-        return;
-      }
-      if (seen.has(reviewer)) {
-        errors.push(`duplicate required reviewer: ${reviewer}`);
-      }
-      seen.add(reviewer);
-    });
-    knownReviewers = seen;
-  }
-
-  if (!Array.isArray(round.results)) {
-    errors.push("results must be an array");
-  } else {
-    const seenReviewers = new Set();
-    round.results.forEach((result, index) => {
-      const label = `results[${index}]`;
-      if (!isMapping(result)) {
-        errors.push(`${label} must be a mapping`);
-        return;
-      }
-
-      for (const key of Object.keys(result)) {
-        if (!RESULT_KEYS.has(key)) {
-          errors.push(`${label} unknown key: ${key}`);
-        }
-      }
-
-      const { reviewer, status } = result;
-      if (!isNonEmptyString(reviewer)) {
-        errors.push(`${label}.reviewer must be a non-empty string`);
-      } else {
-        if (!knownReviewers.has(reviewer)) {
-          errors.push(
-            `${label}.reviewer is not a recognized reviewer: ${reviewer}`,
-          );
-        }
-        if (seenReviewers.has(reviewer)) {
-          errors.push(`duplicate result for reviewer: ${reviewer}`);
-        }
-        seenReviewers.add(reviewer);
-      }
-
-      if (!RESULT_STATUSES.has(status)) {
-        errors.push(
-          `${label}.status must be one of completed, failed, skipped`,
-        );
-      }
-
-      if (status === "completed" && !Array.isArray(result.findings)) {
-        errors.push(
-          `${label}.findings must be an array for a completed result`,
-        );
-      } else if (
-        Object.hasOwn(result, "findings") &&
-        !Array.isArray(result.findings)
-      ) {
-        errors.push(`${label}.findings must be an array when present`);
-      }
-
-      if (Array.isArray(result.findings)) {
-        const seenFindingIds = new Set();
-        result.findings.forEach((finding, findingIndex) => {
-          validateFinding(
-            finding,
-            `${label}.findings[${findingIndex}]`,
-            errors,
-          );
-          if (isMapping(finding) && isNonEmptyString(finding.id)) {
-            if (seenFindingIds.has(finding.id)) {
-              errors.push(
-                `duplicate finding id for reviewer ${reviewer}: ${finding.id}`,
-              );
-            }
-            seenFindingIds.add(finding.id);
-          }
-        });
-      }
-    });
-  }
-
-  return errors;
-}
-
-export function evaluateRound(round) {
-  const errors = collectErrors(round);
-  if (errors.length > 0) {
-    throw new Error(errors.join("\n"));
-  }
-
-  const completedResults = round.results.filter(
-    (result) => result.status === "completed",
-  );
-  const completedReviewers = new Set(
-    completedResults.map((result) => result.reviewer),
-  );
-  const missingReviewers = round.requiredReviewers
-    .filter((reviewer) => !completedReviewers.has(reviewer))
-    .slice()
-    .sort();
-
-  const findingGroupsById = new Map();
-  for (const result of completedResults) {
-    for (const rawFinding of result.findings) {
-      const report = {
-        reviewer: result.reviewer,
-        finding: canonicalizeFinding(rawFinding),
-      };
-      const existing = findingGroupsById.get(report.finding.id);
-      if (existing === undefined) {
-        findingGroupsById.set(report.finding.id, {
-          canonicalReport: report,
-          reportedBy: new Set([result.reviewer]),
-        });
-      } else {
-        existing.reportedBy.add(result.reviewer);
-        if (compareFindingReports(report, existing.canonicalReport) < 0) {
-          existing.canonicalReport = report;
-        }
-      }
-    }
-  }
-
-  const actionable = [...findingGroupsById.values()]
-    .map(({ canonicalReport, reportedBy }) =>
-      createActionableFinding(canonicalReport, reportedBy),
-    )
-    .sort((a, b) => compareLexically(a.id, b.id));
-
-  if (missingReviewers.length > 0) {
-    return { state: "incomplete", actionable, missingReviewers };
-  }
-  if (actionable.length > 0) {
-    if (round.round >= round.maxRounds) {
-      return { state: "limit-reached", actionable, missingReviewers: [] };
-    }
-    return { state: "actionable", actionable, missingReviewers: [] };
-  }
-  return { state: "converged", actionable: [], missingReviewers: [] };
-}
-
-function exitCodeFor(state) {
-  if (state === "converged") {
-    return 0;
-  }
-  if (state === "actionable") {
-    return 2;
-  }
-  return 3;
-}
-
-export function runCli() {
-  const args = process.argv.slice(2);
-  if (args.length !== 1) {
-    console.error("Usage: node scripts/review-round.mjs <review-round.json>");
-    process.exitCode = 3;
-    return;
-  }
-
-  const [path] = args;
-  let raw;
+const USAGE = `Usage:
+  node scripts/review-round.mjs snapshot --repo <root> [--artifact <relative-file>]...
+  node scripts/review-round.mjs panel --repo <root> --harness <host> --mode <standalone|plugin> [--plugin-name <name>]
+  node scripts/review-round.mjs preflight <inventory.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>]
+  node scripts/review-round.mjs evaluate <round.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>] [--artifact <relative-file>]...
+JSON is emitted to stdout. Store reports/inventory outside the reviewed repository.
+Model availability, read-only isolation and actual execution require truthful host/operator attestation.`;
+export function runCli(args = process.argv.slice(2)) {
   try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    console.error(`Unable to read review round file: ${error.message}`);
-    process.exitCode = 3;
-    return;
-  }
-
-  let round;
-  try {
-    round = JSON.parse(raw);
-  } catch (error) {
-    console.error(`Unable to parse review round JSON: ${error.message}`);
-    process.exitCode = 3;
-    return;
-  }
-
-  let result;
-  try {
-    result = evaluateRound(round);
-  } catch (error) {
-    console.error(error.message);
-    process.exitCode = 3;
-    return;
-  }
-
-  console.log(JSON.stringify(result));
-  process.exitCode = exitCodeFor(result.state);
+    if (args.length === 1 && args[0] === "--help") { console.log(USAGE); return; }
+    const [command, ...rest] = args, options = { artifacts: [] };
+    let input;
+    if (["evaluate", "preflight"].includes(command)) input = rest.shift();
+    requireValue(["snapshot", "panel", "preflight", "evaluate"].includes(command), USAGE);
+    const names = { "--repo": "repositoryRoot", "--harness": "harness", "--mode": "mode", "--plugin-name": "pluginName", "--artifact": "artifact" };
+    while (rest.length) {
+      const flag = rest.shift(), value = rest.shift();
+      requireValue(Object.hasOwn(names, flag) && text(value) && !value.startsWith("--"), USAGE);
+      const name = names[flag];
+      if (name === "artifact") options.artifacts.push(value);
+      else { requireValue(options[name] === undefined, `duplicate option: ${flag}`); options[name] = value; }
+    }
+    requireValue(text(options.repositoryRoot), "--repo is required");
+    if (command === "snapshot") { console.log(JSON.stringify(createSnapshot(options.repositoryRoot, options), null, 2)); return; }
+    requireValue(text(options.harness) && text(options.mode), "--harness and --mode are required");
+    const config = loadEffectiveConfig(options);
+    let output;
+    if (command === "panel") output = { configDigest: configDigest(config), maxReviewRounds: config.maxReviewRounds, panel: resolvePanel(config, options.harness, options) };
+    else {
+      requireValue(text(input), USAGE);
+      const document = JSON.parse(readFileSync(input, "utf8"));
+      if (command === "preflight") output = preflight(config, options.harness, options, document);
+      else {
+        output = evaluateRound(document, { ...options, config, snapshot: createSnapshot(options.repositoryRoot, options) });
+        process.exitCode = output.state === "converged" ? 0 : output.state === "actionable" ? 2 : 3;
+      }
+    }
+    console.log(JSON.stringify(output, null, 2));
+  } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
-
-if (isMainModule(import.meta.url)) {
-  runCli();
-}
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) runCli();

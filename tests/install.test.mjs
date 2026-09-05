@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import YAML from "yaml";
 
 import { install } from "../scripts/install.mjs";
 import { renderAll } from "../scripts/render-agents.mjs";
@@ -56,47 +57,30 @@ function sha256(buffer) {
 }
 
 function skillYaml() {
-  return [
-    "version: 1",
-    "maxReviewRounds: 10",
-    "reviewerRetryCount: 1",
-    "documentationPolicy: impact-based",
-    "taskSources:",
-    "  - inline-prompt",
-    "  - local-file",
-    "reviewers:",
-    "  - role: correctness",
-    "    prompt: reviewers/correctness.md",
-    "    fallbackRole: null",
-    "    harnesses:",
-    "      claude: correctness-reviewer",
-    "      copilot: correctness-reviewer",
-    "      codex: correctness-reviewer",
-    "      gemini: correctness-reviewer",
-    "  - role: security",
-    "    prompt: reviewers/security.md",
-    "    fallbackRole: null",
-    "    harnesses:",
-    "      claude: security-reviewer",
-    "      copilot: security-reviewer",
-    "      codex: security-reviewer",
-    "      gemini: security-reviewer",
-    "",
-  ].join("\n");
+  return YAML.stringify({
+    version: 2,
+    strategy: "whole_panel",
+    maxReviewRounds: 10,
+    reviewerRetryCount: 1,
+    documentationPolicy: "impact-based",
+    taskSources: ["inline-prompt", "local-file"],
+    prompt: "reviewers/correctness.md",
+    panels: Object.fromEntries(Object.keys(AGENT_HARNESS_DIRS).map((harness) => [
+      harness, [
+        { id: "correctness-reviewer", model: "model-one", fallback: null },
+        { id: "security-reviewer", model: "model-two", fallback: null },
+      ],
+    ])),
+  });
 }
 
 // Same shape as skillYaml(), but with a single reviewer/harness agent name
 // replaced so tests can exercise a malicious or renamed agent name without
 // hand-maintaining a second full config fixture.
 function skillYamlWithHarnessName(role, harness, name) {
-  const marker = `      ${harness}: ${role}-reviewer`;
-  const lines = skillYaml().split("\n");
-  const index = lines.indexOf(marker);
-  if (index === -1) {
-    throw new Error(`fixture marker not found: ${marker}`);
-  }
-  lines[index] = `      ${harness}: ${name}`;
-  return lines.join("\n");
+  const config = YAML.parse(skillYaml());
+  config.panels[harness].find(({ id }) => id === `${role}-reviewer`).id = name;
+  return YAML.stringify(config);
 }
 
 function skillMarkdown({
@@ -149,11 +133,6 @@ function createFixtureProjectRoot({
     );
     mkdirSync(directory, { recursive: true });
     for (const [filename, content] of Object.entries(files)) {
-      // The rendered filename is not validated here on purpose: fixtures
-      // that intentionally use a path-traversal or multi-segment agent name
-      // (see createTraversalFixtureProjectRoot) need this loop to plant the
-      // matching bytes wherever that filename actually resolves, exactly as
-      // a pre-hardening installer would read them.
       const filePath = join(directory, filename);
       mkdirSync(dirname(filePath), { recursive: true });
       writeFileSync(filePath, content);
@@ -163,15 +142,13 @@ function createFixtureProjectRoot({
   return projectRoot;
 }
 
-// Builds a project root whose reviewer config maps one harness's agent name
-// to an unsafe value (path traversal, or a multi-segment path). The matching
-// "generated" bytes are planted at whatever location that name resolves to,
-// so the fixture proves the installer rejects the filename itself rather
-// than merely failing to find a file that was never written.
+// Corrupt a valid source after rendering: v2 validation rejects unsafe IDs
+// before any source agent lookup or destination writes.
 function createTraversalFixtureProjectRoot({ role, harness, name }) {
-  return createFixtureProjectRoot({
-    reviewersYaml: skillYamlWithHarnessName(role, harness, name),
-  });
+  const projectRoot = createFixtureProjectRoot();
+  writeFileSync(join(projectRoot, "skills/knights-of-the-round-table/config/reviewers.yaml"),
+    skillYamlWithHarnessName(role, harness, name));
+  return projectRoot;
 }
 
 function createGenericSkillFixture(projectRoot, name) {
@@ -1975,15 +1952,65 @@ test("force recovers an interrupted agent transaction after the source changes a
     correctness: "Third correctness review guidance.\n",
     security: "Third security review guidance.\n",
   });
+
   const newestPayloads = renderAll({ projectRoot }).claude;
-
   install({ projectRoot, home, harnesses: ["claude"], force: true });
-
   for (const [filename, content] of Object.entries(newestPayloads)) {
     assert.equal(readFileSync(join(agentsDir, filename), "utf8"), content);
   }
   assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
 });
+
+for (const harness of Object.keys(AGENT_HARNESS_DIRS)) {
+    test(`upgrades an interrupted hash-verified v1 ${harness} snapshot to v2`, (t) => {
+      const projectRoot = withFixture(t), home = withHome(t);
+      assert.throws(() => install({
+        projectRoot, home, harnesses: [harness],
+        onInstallEvent({ phase }) {
+          if (phase === "after-agent-transaction-manifest") throw new Error("legacy interruption");
+        },
+      }), /legacy interruption/);
+      const installedSkill = join(home, SKILL_INSTALL_PATHS[harness]("knights-of-the-round-table"));
+      const configPath = join(installedSkill, "config/reviewers.yaml");
+      // Reconstruct the pre-v2 on-disk snapshot/journal protocol without requiring
+      // Git history or executing old installer code. The bytes below are frozen
+      // from the v1 renderer, not generated by the recovery implementation.
+      const legacy = {
+        version: 1, maxReviewRounds: 10, reviewerRetryCount: 1, documentationPolicy: "impact-based",
+        taskSources: ["inline-prompt", "local-file"],
+        reviewers: [{
+          role: "correctness", prompt: "reviewers/correctness.md", fallbackRole: null,
+          harnesses: Object.fromEntries(Object.keys(AGENT_HARNESS_DIRS).map(h => [h, "correctness-reviewer"])),
+        }],
+      };
+      writeFileSync(configPath, YAML.stringify(legacy));
+      const manifest = readManifest(installedSkill);
+      manifest.files.find(f => f.path === "config/reviewers.yaml").sha256 = sha256(readFileSync(configPath));
+      writeFileSync(join(installedSkill, ".knights-install.json"), JSON.stringify(manifest));
+      const description = "Reviews requirements, logic, edge cases, regressions, and error paths.";
+      const prompt = "Review requirements and edge cases only.";
+      const header = `---\nname: "correctness-reviewer"\ndescription: "${description}"\n`;
+      const payloads = {
+        claude: header + `tools: Read, Grep, Glob\nmodel: inherit\n---\n\n${prompt}\n`,
+        copilot: header + `tools: [read, search]\nuser-invocable: false\n---\n\n${prompt}\n`,
+        codex: `name = "correctness-reviewer"\ndescription = "${description}"\nsandbox_mode = "read-only"\ndeveloper_instructions = "${prompt}"\n`,
+        gemini: header + `tools:\n  - read_file\n  - grep_search\n  - glob\n  - list_directory\nmodel: inherit\n---\n\n${prompt}\n`,
+      };
+      const agentsDir = join(home, AGENT_HARNESS_DIRS[harness]);
+      const journal = readTransactionManifest(agentsDir);
+      const extension = { claude: ".md", copilot: ".agent.md", codex: ".toml", gemini: ".md" }[harness];
+      journal.files = [{ path: `correctness-reviewer${extension}`, sha256: sha256(payloads[harness]) }];
+      writeFileSync(join(agentsDir, TRANSACTION_FILENAME), JSON.stringify(journal));
+      writeFileSync(join(agentsDir, "unrelated.txt"), "preserve");
+      install({ projectRoot, home, harnesses: [harness], force: true });
+      assert.equal(existsSync(join(agentsDir, TRANSACTION_FILENAME)), false);
+      assert.equal(YAML.parse(readFileSync(configPath, "utf8")).version, 2);
+      assert.equal(readFileSync(join(agentsDir, "unrelated.txt"), "utf8"), "preserve");
+      for (const [name, payload] of Object.entries(renderAll({ projectRoot })[harness])) {
+        assert.equal(readFileSync(join(agentsDir, name), "utf8"), payload);
+      }
+    });
+}
 
 test("force recovers a first agent install after the source changes", (t) => {
   const projectRoot = withFixture(t);
@@ -3794,7 +3821,7 @@ test("rejects a reviewer agent name that escapes its harness directory before an
 
     assert.throws(
       () => install({ projectRoot, home, harnesses: [harness] }),
-      /unsafe/i,
+      /unsafe|id must be lowercase hyphenated/i,
       `${harness} ${name}: should refuse to install`,
     );
 
@@ -4008,7 +4035,7 @@ test("CLI installs the canonical skill from the repository for a single harness"
     true,
   );
   assert.equal(
-    existsSync(join(home, ".claude/agents/security-reviewer.md")),
+    existsSync(join(home, ".claude/agents/knights-opus.md")),
     true,
   );
   assert.ok(outcome.stdout.includes(home));

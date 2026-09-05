@@ -25,7 +25,6 @@ export {
 };
 
 const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CANONICAL_SKILL = "knights-of-the-round-table";
 const MANIFEST_PATHS = [
   ".claude-plugin/plugin.json",
   ".codex-plugin/plugin.json",
@@ -34,11 +33,6 @@ const MANIFEST_PATHS = [
   ".agents/plugins/marketplace.json",
 ];
 const NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const RUNTIME_FILES = [
-  "scripts/parse-yaml.mjs",
-  "scripts/validate-config.mjs",
-  "scripts/review-round.mjs",
-];
 
 function isMapping(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -112,9 +106,21 @@ function checkPlugin(root, manifest, { name, version, harness }) {
   checkVersion(manifest.version, version, "plugin");
   checkRepository(manifest);
   checkComponents(root, manifest, "skills", "./skills/", harness !== "codex");
-  if (harness !== "codex") {
-    checkComponents(root, manifest, "agents",
-      harness === "claude" ? "./generated/claude/agents/" : "./agents/");
+  if (harness === "claude") {
+    requireCondition(Array.isArray(manifest.agents) && manifest.agents.length > 0,
+      "Claude agents must be a non-empty explicit Markdown file list");
+    requireCondition(new Set(manifest.agents).size === manifest.agents.length,
+      "Claude agents must not contain duplicate paths");
+    for (const path of manifest.agents) {
+      requireCondition(typeof path === "string" && path.startsWith("./") && path.endsWith(".md"),
+        "Claude agents must contain local ./ Markdown file paths");
+      localPath(root, path);
+    }
+  } else if (harness === "codex") {
+    requireCondition(!Object.hasOwn(manifest, "agents"),
+      "Codex plugin manifests do not support agents; use the explicit installer");
+  } else {
+    checkComponents(root, manifest, "agents", "./agents/");
   }
 }
 
@@ -323,10 +329,6 @@ export function validateRepository({ projectRoot = DEFAULT_PROJECT_ROOT } = {}) 
         }
       });
     }
-    if (entry.name === CANONICAL_SKILL) {
-      capture(`${label}/config/reviewers.yaml`, () =>
-        localPath(skillRoot, "config/reviewers.yaml"));
-    }
   }
   if (result.skillCount === 0) {
     result.errors.push("skills must contain at least one skill directory");
@@ -334,15 +336,17 @@ export function validateRepository({ projectRoot = DEFAULT_PROJECT_ROOT } = {}) 
   const repositoryAgents = capture("reviewer configuration", () =>
     renderRepositoryAgents({ projectRoot: root }));
   if (!repositoryAgents) return result;
-  for (const { name, skillRoot, config } of repositoryAgents.skills) {
-    capture(`skills/${name}/config/reviewers.yaml`, () => {
-      if (name === CANONICAL_SKILL) {
-        assertValidCanonicalConfig(config);
-        for (const path of RUNTIME_FILES) localPath(skillRoot, path);
-      }
-      result.reviewerCount += config.reviewers.length;
-    });
+  for (const { config } of repositoryAgents.skills) {
+    result.reviewerCount += Object.values(config.panels).reduce((count, panel) => count + panel.length, 0);
   }
+  capture("Claude agents", () => {
+    const actual = readJson(root, ".claude-plugin/plugin.json").agents;
+    const expected = Object.keys(repositoryAgents.rendered.claude).sort()
+      .map((filename) => `./generated/claude/agents/${filename}`);
+    requireCondition(Array.isArray(actual) &&
+      JSON.stringify([...actual].sort()) === JSON.stringify(expected),
+    "Claude agents file list must match the repository renderer outputs");
+  });
   capture("generated agents", () => {
     const generated = checkGeneratedAgents(repositoryAgents.rendered, { projectRoot: root });
     result.generatedAgentCount = generated.fileCount;
@@ -366,7 +370,7 @@ function runConfigCli(configPath) {
     return;
   }
 
-  const errors = validateCanonicalConfig(config);
+  const errors = validateConfig(config);
   if (errors.length > 0) {
     for (const error of errors) {
       console.error(error);
@@ -376,8 +380,8 @@ function runConfigCli(configPath) {
   }
 
   console.log(
-    `Validated ${config.reviewers.length} reviewer roles across ${
-      Object.keys(config.reviewers[0].harnesses).length
+    `Validated ${Object.values(config.panels).reduce((count, panel) => count + panel.length, 0)} whole-panel reviewers across ${
+      Object.keys(config.panels).length
     } harnesses.`,
   );
 }
@@ -395,7 +399,7 @@ function runCli() {
   }
   console.log(
     `Validated ${result.skillCount} skill${result.skillCount === 1 ? "" : "s"}, ` +
-    `${result.reviewerCount} reviewer roles, ${result.generatedAgentCount} generated agents, ` +
+    `${result.reviewerCount} whole-panel reviewers, ${result.generatedAgentCount} generated agents, ` +
     `and ${result.manifestCount} manifests.`,
   );
 }

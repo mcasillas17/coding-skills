@@ -33,20 +33,8 @@ const HARNESS_EXTENSIONS = {
   codex: ".toml",
   gemini: ".md",
 };
-const REVIEWER_DESCRIPTIONS = {
-  architecture:
-    "Reviews boundaries, coupling, consistency, maintainability, and migration impact.",
-  correctness:
-    "Reviews requirements, logic, edge cases, regressions, and error paths.",
-  documentation:
-    "Reviews impacted setup, examples, API documentation, diagrams, and screenshots.",
-  performance:
-    "Reviews repeated I/O, algorithmic cost, memory, queries, network use, and caching.",
-  security:
-    "Reviews exploitable trust-boundary, authorization, injection, secret, and dependency risks.",
-  tests:
-    "Reviews behavioral coverage, false-positive tests, and untested failure paths.",
-};
+const REVIEWER_DESCRIPTION =
+  "Reviews correctness, tests, security, documentation, architecture, and performance without editing files.";
 
 function quote(value) {
   return JSON.stringify(value);
@@ -57,19 +45,19 @@ function normalizePrompt(prompt) {
 }
 
 const renderers = {
-  claude: ({ name, description, prompt }) =>
+  claude: ({ name, model, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
-    `tools: Read, Grep, Glob\nmodel: inherit\n---\n\n${prompt}\n`,
-  copilot: ({ name, description, prompt }) =>
+    `tools: Read, Grep, Glob\nmodel: ${quote(model)}\n---\n\n${prompt}\n`,
+  copilot: ({ name, model, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
-    `tools: [read, search]\nuser-invocable: false\n---\n\n${prompt}\n`,
-  codex: ({ name, description, prompt }) =>
+    `tools: [read, search]\nmodel: ${quote(model)}\nuser-invocable: false\n---\n\n${prompt}\n`,
+  codex: ({ name, model, description, prompt }) =>
     `name = ${quote(name)}\ndescription = ${quote(description)}\n` +
-    `sandbox_mode = "read-only"\ndeveloper_instructions = ${quote(prompt)}\n`,
-  gemini: ({ name, description, prompt }) =>
+    `model = ${quote(model)}\nsandbox_mode = "read-only"\ndeveloper_instructions = ${quote(prompt)}\n`,
+  gemini: ({ name, model, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
     "tools:\n  - read_file\n  - grep_search\n  - glob\n  - list_directory\n" +
-    `model: inherit\n---\n\n${prompt}\n`,
+    `model: ${quote(model)}\n---\n\n${prompt}\n`,
 };
 
 function lstatIfExists(path) {
@@ -143,15 +131,11 @@ function loadConfig(skillRoot) {
 }
 
 function loadPrompts(config, skillRoot) {
-  return Object.fromEntries(
-    config.reviewers.map(({ role, prompt }) => {
-      try {
-        return [prompt, readFileSync(reviewerInputPath(skillRoot, prompt), "utf8")];
-      } catch (error) {
-        throw new Error(`reviewer ${role} prompt: ${error.message}`, { cause: error });
-      }
-    }),
-  );
+  try {
+    return { [config.prompt]: readFileSync(reviewerInputPath(skillRoot, config.prompt), "utf8") };
+  } catch (error) {
+    throw new Error(`whole-panel reviewer prompt: ${error.message}`, { cause: error });
+  }
 }
 
 function outputFilename(harness, name) {
@@ -163,25 +147,27 @@ export function renderAgents(config, prompts) {
     Object.keys(HARNESS_DIRECTORIES).map((harness) => [harness, {}]),
   );
 
-  for (const reviewer of config.reviewers) {
-    const prompt = normalizePrompt(prompts[reviewer.prompt]);
-    const description =
-      REVIEWER_DESCRIPTIONS[reviewer.role] ??
-      `Reviews changes from the ${reviewer.role} perspective.`;
-
-    for (const harness of Object.keys(HARNESS_DIRECTORIES)) {
-      const name = reviewer.harnesses[harness];
-      const filename = outputFilename(harness, name);
-      if (Object.hasOwn(rendered[harness], filename)) {
-        throw new Error(
-          `duplicate output filename for ${harness}: ${filename}`,
-        );
+  const prompt = normalizePrompt(prompts[config.prompt]);
+  for (const harness of Object.keys(HARNESS_DIRECTORIES)) {
+    const modelsById = new Map();
+    for (const primary of config.panels[harness]) {
+      for (const reviewer of [primary, primary.fallback].filter(Boolean)) {
+        const { id: name, model } = reviewer;
+        if (modelsById.has(name)) {
+          if (modelsById.get(name) !== model) {
+            throw new Error(`Conflicting reviewer ID for ${harness}: ${name}`);
+          }
+          continue;
+        }
+        modelsById.set(name, model);
+        const filename = outputFilename(harness, name);
+        rendered[harness][filename] = renderers[harness]({
+          name,
+          model,
+          description: REVIEWER_DESCRIPTION,
+          prompt,
+        });
       }
-      rendered[harness][filename] = renderers[harness]({
-        name,
-        description,
-        prompt,
-      });
     }
   }
 

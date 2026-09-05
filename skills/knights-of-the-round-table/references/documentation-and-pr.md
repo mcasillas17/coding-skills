@@ -28,19 +28,23 @@ convergence.
 Do not open a pull request of any kind — including a draft pull request — until
 all of the following hold:
 
-1. Every required reviewer role has completed, through its primary agent or a
+1. Every configured model reviewer has independently covered all six dimensions, through its primary agent or a
    configured fallback (see `references/review-loop.md`).
-2. No actionable findings remain (`evaluateRound` reports `converged`).
+2. No actionable findings remain (`evaluateRound` reports `converged` and
+   `publicationReady: true` for a current final-phase snapshot below the cap).
 3. Final validation has been run against the last code or documentation change and
    passed.
 4. Impact-based documentation updates required by this change are already made.
 
 ## Sequence
 
-1. Run final validation.
-2. Create focused commits describing the change.
-3. Push the feature branch without force.
-4. Automatically open the pull request using the body built from
+1. Converge implementation review, then update materially affected documentation.
+2. Run final validation and a final fresh full-model-panel review of the documented
+   state. Keep the same round budget; incomplete or capped runs never publish.
+3. Re-evaluate the current state before staging only task-owned changes. Create
+   focused commits describing the change; verify hooks did not change the content.
+4. Push the feature branch without force.
+5. Automatically open the pull request using the body built from
    `assets/pr-body-template.md`.
 
 ## Pull request body requirements
@@ -49,7 +53,8 @@ The rendered body, based on `assets/pr-body-template.md`, must include:
 
 - a task and implementation summary;
 - validation performed and its results;
-- the number of review rounds completed and which reviewer roles ran;
+- the number of review rounds completed, requested models and actual invocation
+  identities/models, including fallback reasons and coverage;
 - every accepted and fixed finding;
 - every intentionally rejected finding with its recorded evidence or reason;
 - documentation changed, including any diagrams or screenshots;

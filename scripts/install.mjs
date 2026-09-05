@@ -32,6 +32,7 @@ import YAML from "yaml";
 import { isMainModule } from "./is-main-module.mjs";
 import { assertValidConfig, isSafeRelativePath } from "./validate.mjs";
 import { renderAgents, renderAll } from "./render-agents.mjs";
+import { assertLegacyV1Config, renderLegacyV1Agents } from "./legacy-v1-agents.mjs";
 
 const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const DEFAULT_SKILL = "knights-of-the-round-table";
@@ -90,10 +91,8 @@ const GENERATED_AGENT_SOURCE_DIRS = {
 };
 
 // Expected filename extension per harness, mirroring render-agents.mjs's
-// HARNESS_EXTENSIONS. Reviewer config only requires each harness agent name
-// to be a non-empty string (see validate-config.mjs), so a malicious or
-// corrupted config could set one to a path-traversal sequence such as
-// `../../../pwned`. Every filename derived from that config must be
+// HARNESS_EXTENSIONS. Independently of reviewer config validation, every
+// filename derived from that config must be
 // re-checked here before it is ever joined into a source or destination
 // directory.
 const AGENT_HARNESS_EXTENSIONS = {
@@ -1146,7 +1145,8 @@ function deriveInstalledSkillAgentPayloads({
         configPath,
       ).toString("utf8"),
     );
-    assertValidConfig(config);
+    if (config?.version === 1) assertLegacyV1Config(config);
+    else assertValidConfig(config);
   } catch (error) {
     throw new Error(
       `Refusing to install: installed skill reviewer configuration is invalid: ${join(directory, configPath)}`,
@@ -1154,16 +1154,10 @@ function deriveInstalledSkillAgentPayloads({
     );
   }
 
-  const prompts = {};
-  for (const reviewer of config.reviewers) {
-    prompts[reviewer.prompt] = readVerifiedInstalledSkillFile(
-      directory,
-      manifest.files,
-      reviewer.prompt,
-    ).toString("utf8");
-  }
-
-  const rendered = renderAgents(config, prompts);
+  const readPrompt = path => readVerifiedInstalledSkillFile(directory, manifest.files, path).toString("utf8");
+  const rendered = config.version === 1
+    ? renderLegacyV1Agents(config, readPrompt)
+    : renderAgents(config, { [config.prompt]: readPrompt(config.prompt) });
   return Object.fromEntries(
     harnesses.map((harness) => {
       const files = Object.entries(rendered[harness]).map(

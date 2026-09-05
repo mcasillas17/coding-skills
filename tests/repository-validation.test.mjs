@@ -31,7 +31,7 @@ const plugin = {
   skills: "./skills/",
 };
 const manifests = [
-  { ...plugin, agents: "./generated/claude/agents/" },
+  { ...plugin, agents: Object.keys(renderAll().claude).sort().map((file) => `./generated/claude/agents/${file}`) },
   { ...plugin },
   { ...plugin, agents: "./agents/" },
   {
@@ -69,6 +69,10 @@ function fixture(t) {
   for (const path of ["skills", "agents", "generated", ".generated-agents.json", "package.json", "VERSION"]) {
     cpSync(join(projectRoot, path), join(root, path), { recursive: true });
   }
+  // Generic dependency validation follows declared local references, not a
+  // hard-coded skill name or an assumed runtime layout.
+  const entrypoint = `${skillPath}/SKILL.md`;
+  write(root, entrypoint, `${readFileSync(join(root, entrypoint), "utf8")}\nSupport parser: \`scripts/parse-yaml.mjs\`.\n`);
   manifestPaths.forEach((path, i) => writeJson(root, path, manifests[i]));
   return root;
 }
@@ -93,14 +97,23 @@ function addSkill(root, name = "second-skill", body = "") {
 function addReviewerSkill(root, name = "second-skill") {
   addSkill(root, name);
   const config = YAML.parse(readFileSync(join(root, skillPath, "config/reviewers.yaml"), "utf8"));
-  config.reviewers = [{
-    role: "extra", prompt: "reviewers/extra.md", fallbackRole: null,
-    harnesses: Object.fromEntries(["claude", "copilot", "codex", "gemini"].map((h) => [h, "extra-reviewer"])),
-  }];
+  config.prompt = "reviewers/extra.md";
+  config.panels = Object.fromEntries(["claude", "copilot", "codex", "gemini"].map((h) =>
+    [h, [{ id: "extra-reviewer", model: "extra-model", fallback: null }]]));
   write(root, `skills/${name}/config/reviewers.yaml`, YAML.stringify(config));
   write(root, `skills/${name}/reviewers/extra.md`, "Review the extra behavior.\n");
   return config;
 }
+
+function refreshClaudeManifest(root) {
+  editJson(root, manifestPaths[0], (manifest) => {
+    manifest.agents = Object.keys(renderRepositoryAgents({ projectRoot: root }).rendered.claude)
+      .sort().map((file) => `./generated/claude/agents/${file}`);
+  });
+}
+
+const canonicalCounts = { claude: 3, copilot: 4, codex: 2, gemini: 2 };
+const canonicalAgentCount = Object.values(canonicalCounts).reduce((a, b) => a + b, 0);
 
 function generatedSnapshot(root, encoding = "utf8") {
   const paths = JSON.parse(readFileSync(join(root, ".generated-agents.json"), "utf8")).files;
@@ -115,7 +128,7 @@ test("repository ships all five native distribution manifests", () => {
     assert.doesNotThrow(() => JSON.parse(readFileSync(join(projectRoot, path), "utf8")), path);
   }
   assert.deepEqual(validate(projectRoot), {
-    errors: [], skillCount: 1, reviewerCount: 6, generatedAgentCount: 24, manifestCount: 5,
+    errors: [], skillCount: 1, reviewerCount: canonicalAgentCount, generatedAgentCount: canonicalAgentCount, manifestCount: 5,
   });
   const rootManifest = JSON.parse(readFileSync(join(projectRoot, "plugin.json"), "utf8"));
   assert.equal(rootManifest.$schema, undefined, "use the Copilot-native shape");
@@ -126,7 +139,7 @@ test("repository ships all five native distribution manifests", () => {
 
 test("valid fixture needs no repository URLs and reports all component counts", (t) => {
   assert.deepEqual(validate(fixture(t)), {
-    errors: [], skillCount: 1, reviewerCount: 6, generatedAgentCount: 24, manifestCount: 5,
+    errors: [], skillCount: 1, reviewerCount: canonicalAgentCount, generatedAgentCount: canonicalAgentCount, manifestCount: 5,
   });
 });
 
@@ -160,6 +173,12 @@ const invalidManifests = [
   [0, (m) => { delete m.name; }, /name/],
   [1, (m) => { m.skills = "./skills/missing/"; }, /skills/],
   [0, (m) => { m.agents = "./agents/"; }, /agents/],
+  [0, (m) => { m.agents = "./generated/claude/agents/"; }, /agents/],
+  [0, (m) => { m.agents = []; }, /agents/],
+  [0, (m) => { m.agents.pop(); }, /agents/],
+  [0, (m) => { m.agents.push(m.agents[0]); }, /agents/],
+  [0, (m) => { m.agents.push("../outside.md"); }, /path|agents/],
+  [1, (m) => { m.agents = "./generated/codex/agents/"; }, /agents/],
   [2, (m) => { m.agents = "./generated/claude/agents/"; }, /agents/],
   [2, (m) => { m.skills = ["./skills/", "../outside"]; }, /path|outside/],
   [2, (m) => { m.agents = [42]; }, /agents/],
@@ -240,7 +259,7 @@ test("enumerates two skills including a generic skill with no reviewer configura
   write(root, "skills/second-skill/references/guide.md", "A complete guide.\n");
   write(root, "skills/second-skill/assets/example.json", "{}\n");
   assert.deepEqual(validate(root), {
-    errors: [], skillCount: 2, reviewerCount: 6, generatedAgentCount: 24, manifestCount: 5,
+    errors: [], skillCount: 2, reviewerCount: canonicalAgentCount, generatedAgentCount: canonicalAgentCount, manifestCount: 5,
   });
   rmSync(join(root, "skills/second-skill/SKILL.md"));
   expectInvalid(root, /second-skill.*SKILL\.md/);
@@ -421,10 +440,10 @@ test("does not scan design plans, generated code, or substrings as prose placeho
 });
 
 for (const [harness, path] of [
-  ["Claude", "generated/claude/agents/correctness-reviewer.md"],
-  ["Copilot", "agents/correctness-reviewer.agent.md"],
-  ["Codex", "generated/codex/agents/correctness-reviewer.toml"],
-  ["Gemini", "generated/gemini/agents/correctness-reviewer.md"],
+  ["Claude", "generated/claude/agents/knights-opus.md"],
+  ["Copilot", "agents/knights-grok.agent.md"],
+  ["Codex", "generated/codex/agents/knights-sol.toml"],
+  ["Gemini", "generated/gemini/agents/knights-flash.md"],
 ]) {
   for (const missing of [true, false]) {
     test(`rejects ${missing ? "missing" : "stale"} generated ${harness} agent`, (t) => {
@@ -449,28 +468,56 @@ for (const harness of ["claude", "copilot", "codex", "gemini"]) {
     const root = fixture(t);
     const path = `${skillPath}/config/reviewers.yaml`;
     const config = YAML.parse(readFileSync(join(root, path), "utf8"));
-    delete config.reviewers[0].harnesses[harness];
+    delete config.panels[harness];
     write(root, path, YAML.stringify(config));
-    expectInvalid(root, /missing harness mapping/);
+    expectInvalid(root, /panel|harness/i);
   });
 }
 
-test("keeps the canonical reviewer floor enforced", (t) => {
+test("accepts a replacement panel with no fixed canonical role or reviewer count", (t) => {
   const root = fixture(t);
   const path = `${skillPath}/config/reviewers.yaml`;
   const config = YAML.parse(readFileSync(join(root, path), "utf8"));
-  config.reviewers = config.reviewers.filter((r) => r.role !== "tests");
+  config.panels.claude = [{ id: "replacement", model: "replacement-model", fallback: null }];
   write(root, path, YAML.stringify(config));
-  expectInvalid(root, /canonical reviewer role is required: tests/);
+  synchronizeGeneratedAgents({ projectRoot: root });
+  refreshClaudeManifest(root);
+  assert.deepEqual(validate(root).errors, []);
+});
+
+test("repository discovery and validation do not require a fixed skill directory name", (t) => {
+  const root = fixture(t);
+  const renamed = "renamed-review-skill";
+  renameSync(join(root, skillPath), join(root, "skills", renamed));
+  const entrypoint = `skills/${renamed}/SKILL.md`;
+  write(root, entrypoint, readFileSync(join(root, entrypoint), "utf8")
+    .replace(`name: ${skillName}`, `name: ${renamed}`));
+  assert.deepEqual(renderRepositoryAgents({ projectRoot: root }).skills.map(({ name }) => name), [renamed]);
+  assert.deepEqual(validate(root).errors, []);
+});
+
+test("Claude manifest includes configured fallbacks and rejects unrendered Markdown files", (t) => {
+  const root = fixture(t);
+  const configPath = `${skillPath}/config/reviewers.yaml`;
+  const config = YAML.parse(readFileSync(join(root, configPath), "utf8"));
+  config.panels.claude[0].fallback = { id: "backup-reviewer", model: "backup-model" };
+  write(root, configPath, YAML.stringify(config));
+  synchronizeGeneratedAgents({ projectRoot: root });
+  expectInvalid(root, /Claude agents file list/);
+  refreshClaudeManifest(root);
+  assert.deepEqual(validate(root).errors, []);
+  write(root, "generated/claude/agents/manual.md", "---\nname: manual\n---\nManual agent.");
+  editJson(root, manifestPaths[0], (manifest) => manifest.agents.push("./generated/claude/agents/manual.md"));
+  expectInvalid(root, /Claude agents file list/);
 });
 
 for (const missingConfig of ["removed", "renamed"]) {
   for (const check of [false, true]) {
     test(`repository renderer fails closed with only config ${missingConfig} (check=${check})`, (t) => {
       const root = fixture(t);
-      assert.equal(synchronizeGeneratedAgents({ projectRoot: root }).fileCount, 24);
+      assert.equal(synchronizeGeneratedAgents({ projectRoot: root }).fileCount, canonicalAgentCount);
       const before = generatedSnapshot(root, null);
-      assert.equal(Object.keys(before).length, 25, "snapshot includes 24 agents and ownership");
+      assert.equal(Object.keys(before).length, canonicalAgentCount + 1, "snapshot includes all agents and ownership");
       const configPath = join(root, skillPath, "config/reviewers.yaml");
       if (missingConfig === "removed") rmSync(configPath);
       else renameSync(configPath, `${configPath}.disabled`);
@@ -488,26 +535,25 @@ test("explicit renderAll inputs do not require a discovered reviewer config", (t
   const expected = renderAll({ projectRoot: root });
   const configPath = join(root, skillPath, "config/reviewers.yaml");
   const config = YAML.parse(readFileSync(configPath, "utf8"));
-  const prompts = Object.fromEntries(config.reviewers.map(({ prompt }) =>
-    [prompt, readFileSync(join(root, skillPath, prompt), "utf8")]));
+  const prompts = { [config.prompt]: readFileSync(join(root, skillPath, config.prompt), "utf8") };
   renameSync(configPath, `${configPath}.disabled`);
   assert.deepEqual(renderAll({ projectRoot: root, config, prompts }), expected);
 });
 
-test("renderAll defaults to the canonical 24 agents even with a second reviewer skill", (t) => {
+test("renderAll defaults to its skill while repository rendering discovers every skill", (t) => {
   const root = fixture(t);
   const canonical = renderAll({ projectRoot: root });
   addReviewerSkill(root);
 
   const rendered = renderAll({ projectRoot: root });
-  for (const files of Object.values(rendered)) {
-    assert.equal(Object.keys(files).length, 6, "renderAll must remain canonical-only");
+  for (const [harness, files] of Object.entries(rendered)) {
+    assert.equal(Object.keys(files).length, canonicalCounts[harness], "renderAll must remain single-skill");
   }
   assert.deepEqual(rendered, canonical);
   const repository = renderRepositoryAgents({ projectRoot: root });
   assert.deepEqual(repository.skills.map(({ name }) => name), [skillName, "second-skill"]);
-  for (const files of Object.values(repository.rendered)) {
-    assert.equal(Object.keys(files).length, 7, "repository rendering must include both skills");
+  for (const [harness, files] of Object.entries(repository.rendered)) {
+    assert.equal(Object.keys(files).length, canonicalCounts[harness] + 1, "repository rendering must include both skills");
   }
 });
 
@@ -530,13 +576,13 @@ test("explicit synchronization inputs render only the supplied config in a multi
 
 for (const harness of ["claude", "copilot", "codex", "gemini"]) {
   for (const unrelatedConfig of ["valid", "invalid"]) {
-    test(`Knights install owns only six ${harness} agents with ${unrelatedConfig} unrelated config`, (t) => {
+    test(`Knights install owns only its ${harness} panel with ${unrelatedConfig} unrelated config`, (t) => {
       const root = fixture(t);
       const canonical = renderAll({ projectRoot: root })[harness];
       const config = addReviewerSkill(root);
-      assert.equal(synchronizeGeneratedAgents({ projectRoot: root }).fileCount, 28);
+      assert.equal(synchronizeGeneratedAgents({ projectRoot: root }).fileCount, canonicalAgentCount + 4);
       if (unrelatedConfig === "invalid") {
-        config.reviewers = [];
+        config.panels.claude = [];
         write(root, "skills/second-skill/config/reviewers.yaml", YAML.stringify(config));
       }
       const before = generatedSnapshot(root, null);
@@ -549,7 +595,7 @@ for (const harness of ["claude", "copilot", "codex", "gemini"]) {
       const ownership = JSON.parse(readFileSync(join(agentsDirectory, ".knights-install.json"), "utf8"));
       assert.equal(ownership.skill, skillName);
       assert.deepEqual(ownership.harnesses, [harness]);
-      assert.equal(ownership.files.length, 6, "Knights must not own the second skill's agent");
+      assert.equal(ownership.files.length, canonicalCounts[harness], "Knights must not own the second skill's agent");
       assert.deepEqual(ownership.files.map(({ path }) => path).sort(), Object.keys(canonical).sort());
       assert.deepEqual(readdirSync(agentsDirectory).sort(),
         [".knights-install.json", ...Object.keys(canonical)].sort());
@@ -564,7 +610,7 @@ for (const harness of ["claude", "copilot", "codex", "gemini"]) {
   }
 }
 
-test("repository render CLI writes and checks all 28 agents across two skills", (t) => {
+test("repository render CLI writes and checks all agents across two skills", (t) => {
   const root = fixture(t);
   addReviewerSkill(root);
   mkdirSync(join(root, "scripts"));
@@ -581,10 +627,10 @@ test("repository render CLI writes and checks all 28 agents across two skills", 
 
   const rendered = run();
   assert.equal(rendered.status, 0, rendered.stderr);
-  assert.equal(rendered.stdout.trim(), "Rendered 28 reviewer agents.");
+  assert.equal(rendered.stdout.trim(), `Rendered ${canonicalAgentCount + 4} reviewer agents.`);
   assert.equal(rendered.stderr, "");
   const after = generatedSnapshot(root, null);
-  assert.equal(Object.keys(after).length, 29, "28 agents plus ownership");
+  assert.equal(Object.keys(after).length, canonicalAgentCount + 5, "all agents plus ownership");
   const current = run("--check");
   assert.equal(current.status, 0, current.stderr);
   assert.equal(current.stdout.trim(), "Generated reviewer agents are current.");
@@ -616,7 +662,8 @@ test("validates and renders reviewers belonging to another skill without Knights
   rmSync(manifestPath);
 
   const result = synchronizeGeneratedAgents({ projectRoot: root });
-  assert.equal(result.fileCount, 28, "renderer must generate 24 canonical + 4 extra agents");
+  assert.equal(result.fileCount, canonicalAgentCount + 4, "renderer must generate both skills' agents");
+  refreshClaudeManifest(root);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   assert.deepEqual(manifest, {
     version: 1, files: [...canonicalPaths, ...extraPaths].sort(),
@@ -624,14 +671,14 @@ test("validates and renders reviewers belonging to another skill without Knights
   const before = generatedSnapshot(root);
   for (const path of extraPaths) assert.match(before[path], /Review the extra behavior/);
   assert.deepEqual(synchronizeGeneratedAgents({ projectRoot: root }), {
-    drift: [], fileCount: 28,
+    drift: [], fileCount: canonicalAgentCount + 4,
   });
   assert.deepEqual(synchronizeGeneratedAgents({ projectRoot: root, check: true }), {
-    drift: [], fileCount: 28,
+    drift: [], fileCount: canonicalAgentCount + 4,
   });
   assert.deepEqual(generatedSnapshot(root), before, "repeat render/check must not change or delete owned files");
   assert.deepEqual(validate(root), {
-    errors: [], skillCount: 2, reviewerCount: 7, generatedAgentCount: 28, manifestCount: 5,
+    errors: [], skillCount: 2, reviewerCount: canonicalAgentCount + 4, generatedAgentCount: canonicalAgentCount + 4, manifestCount: 5,
   });
   rmSync(join(root, "skills/second-skill/reviewers/extra.md"));
   expectInvalid(root, /prompt/);
@@ -641,12 +688,13 @@ for (const harness of ["claude", "copilot", "codex", "gemini"]) {
   test(`repository renderer rejects cross-skill ${harness} filename collisions before writes`, (t) => {
     const root = fixture(t);
     const config = addReviewerSkill(root);
-    config.reviewers[0].harnesses[harness] = "correctness-reviewer";
+    const id = Object.keys(renderAll({ projectRoot: root })[harness])[0].split(".")[0];
+    config.panels[harness][0].id = id;
     write(root, "skills/second-skill/config/reviewers.yaml", YAML.stringify(config));
     const before = generatedSnapshot(root);
     for (const check of [false, true]) {
       assert.throws(() => synchronizeGeneratedAgents({ projectRoot: root, check }),
-        new RegExp(`duplicate.*${harness}.*correctness-reviewer`));
+        new RegExp(`duplicate.*${harness}.*${id}`));
       assert.deepEqual(generatedSnapshot(root), before);
     }
     expectInvalid(root, /duplicate/);
@@ -654,12 +702,12 @@ for (const harness of ["claude", "copilot", "codex", "gemini"]) {
 }
 
 for (const [label, mutate, pattern] of [
-  ["invalid config", (config) => { config.reviewers = []; }, /reviewers must be a non-empty array/],
+  ["invalid config", (config) => { config.panels.claude = []; }, /claude.*non-empty array/],
   ["invalid round limit", (config) => { config.maxReviewRounds = 0; }, /maxReviewRounds/],
-  ["unknown config key", (config) => { config.unrecognized = true; }, /unknown top-level key/],
-  ["missing harness mapping", (config) => { delete config.reviewers[0].harnesses.codex; }, /missing harness mapping/],
-  ["traversal prompt", (config) => { config.reviewers[0].prompt = "../outside.md"; }, /safe relative path/],
-  ["missing prompt", (config) => { config.reviewers[0].prompt = "reviewers/missing.md"; }, /ENOENT|prompt/],
+  ["unknown config key", (config) => { config.unrecognized = true; }, /unknown key/],
+  ["missing harness panel", (config) => { delete config.panels.codex; }, /panel|harness/i],
+  ["traversal prompt", (config) => { config.prompt = "../outside.md"; }, /safe relative path/],
+  ["missing prompt", (config) => { config.prompt = "reviewers/missing.md"; }, /ENOENT|prompt/],
 ]) {
   test(`repository renderer rejects another skill's ${label} before writes`, (t) => {
     const root = fixture(t);
@@ -702,7 +750,7 @@ for (const path of [
   `${skillPath}/scripts/parse-yaml.mjs`,
   `${skillPath}/scripts/validate-config.mjs`,
   `${skillPath}/scripts/review-round.mjs`,
-  `${skillPath}/reviewers/correctness.md`,
+  `${skillPath}/reviewers/whole-panel.md`,
 ]) {
   test(`rejects missing required runtime/config/prompt file: ${path}`, (t) => {
     const root = fixture(t);
@@ -714,8 +762,8 @@ for (const path of [
 for (const path of [
   "plugin.json", ".generated-agents.json", "skills",
   skillPath, `${skillPath}/SKILL.md`, `${skillPath}/config`,
-  `${skillPath}/scripts/review-round.mjs`, `${skillPath}/reviewers/correctness.md`,
-  "agents/correctness-reviewer.agent.md", "generated/claude/agents",
+  `${skillPath}/scripts/review-round.mjs`, `${skillPath}/reviewers/whole-panel.md`,
+  "agents/knights-grok.agent.md", "generated/claude/agents",
 ]) {
   test(`rejects symlinked validation input: ${path}`, (t) => {
     const root = fixture(t);
@@ -735,13 +783,13 @@ test("rejects symlinked references without following files outside the skill", (
   expectInvalid(root, /symlink|inside/);
 });
 
-test("custom config-path CLI preserves focused legacy output", () => {
+test("custom config-path CLI reports whole-panel primary counts", () => {
   const result = spawnSync(process.execPath, [
     join(projectRoot, "scripts/validate.mjs"),
     join(projectRoot, skillPath, "config/reviewers.yaml"),
   ], { encoding: "utf8", cwd: tmpdir() });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "Validated 6 reviewer roles across 4 harnesses.");
+  assert.equal(result.stdout.trim(), `Validated ${canonicalAgentCount} whole-panel reviewers across 4 harnesses.`);
   assert.equal(result.stderr, "");
 });
 
@@ -764,11 +812,11 @@ test("rejects stale changed harness mapping without changing generated artifacts
   const root = fixture(t);
   const path = `${skillPath}/config/reviewers.yaml`;
   const config = YAML.parse(readFileSync(join(root, path), "utf8"));
-  config.reviewers[0].harnesses.codex = "renamed-reviewer";
+  config.panels.codex[0].id = "renamed-reviewer";
   write(root, path, YAML.stringify(config));
   const ownership = readFileSync(join(root, ".generated-agents.json"), "utf8");
   expectInvalid(root, /renamed-reviewer/);
   assert.equal(readFileSync(join(root, ".generated-agents.json"), "utf8"), ownership);
-  assert.equal(readFileSync(join(root, "generated/codex/agents/correctness-reviewer.toml"), "utf8"),
-    readFileSync(join(projectRoot, "generated/codex/agents/correctness-reviewer.toml"), "utf8"));
+  assert.equal(readFileSync(join(root, "generated/codex/agents/knights-sol.toml"), "utf8"),
+    readFileSync(join(projectRoot, "generated/codex/agents/knights-sol.toml"), "utf8"));
 });

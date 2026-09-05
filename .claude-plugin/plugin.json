@@ -4,5 +4,9 @@
   "description": "Cross-harness implementation, review, documentation, and pull request skill",
   "license": "MIT",
   "skills": "./skills/",
-  "agents": "./generated/claude/agents/"
+  "agents": [
+    "./generated/claude/agents/knights-haiku.md",
+    "./generated/claude/agents/knights-opus.md",
+    "./generated/claude/agents/knights-sonnet.md"
+  ]
 }

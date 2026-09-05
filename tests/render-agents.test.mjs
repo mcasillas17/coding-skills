@@ -30,30 +30,17 @@ const harnessDirectories = {
   gemini: "generated/gemini/agents",
 };
 
-function harnessNames(name) {
-  return {
-    claude: name,
-    copilot: name,
-    codex: name,
-    gemini: name,
-  };
-}
-
 function validConfig(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
+    strategy: "whole_panel",
     maxReviewRounds: 10,
     reviewerRetryCount: 1,
     documentationPolicy: "impact-based",
     taskSources: ["inline-prompt", "local-file"],
-    reviewers: [
-      {
-        role: "correctness",
-        prompt: "reviewers/correctness.md",
-        fallbackRole: null,
-        harnesses: harnessNames("correctness-reviewer"),
-      },
-    ],
+    prompt: "reviewers/whole-panel.md",
+    panels: Object.fromEntries(Object.keys(harnessDirectories).map((harness) =>
+      [harness, [{ id: "correctness-reviewer", model: "explicit-model", fallback: null }]])),
     ...overrides,
   };
 }
@@ -65,7 +52,7 @@ function createRendererProject() {
     "skills/knights-of-the-round-table/reviewers",
   );
   mkdirSync(promptDirectory, { recursive: true });
-  writeFileSync(join(promptDirectory, "correctness.md"), "Review only.");
+  writeFileSync(join(promptDirectory, "whole-panel.md"), "Review only.");
   return projectRoot;
 }
 
@@ -143,48 +130,37 @@ function embeddedPrompt(harness, content) {
   return JSON.parse(match[1]);
 }
 
-test("renderer produces six reviewers for every harness", () => {
-  const rendered = renderAll();
-
-  assert.deepEqual(Object.keys(rendered), [
-    "claude",
-    "copilot",
-    "codex",
-    "gemini",
-  ]);
-  for (const [harness, files] of Object.entries(rendered)) {
-    assert.equal(
-      Object.keys(files).length,
-      6,
-      `${harness} should contain six reviewers`,
-    );
+test("renderer produces one whole-panel agent per model with explicit native controls", () => {
+  const config = validConfig();
+  config.panels.copilot.push({ id: "another-model", model: "model-two", fallback: null });
+  const prompt = "Review all six dimensions.\nLine \"two\"\\three";
+  const rendered = renderer.renderAgents(config, { [config.prompt]: prompt });
+  assert.deepEqual(Object.keys(rendered), Object.keys(harnessDirectories));
+  for (const [harness, entries] of Object.entries(config.panels)) {
+    assert.equal(Object.keys(rendered[harness]).length, entries.length);
+    for (const { id, model } of entries) {
+      const filename = `${id}${harness === "codex" ? ".toml" : harness === "copilot" ? ".agent.md" : ".md"}`;
+      const content = rendered[harness][filename];
+      assert.ok(content, `${harness} uses the local ID as filename`);
+      const separator = harness === "codex" ? " = " : ": ";
+      assert.ok(content.includes(`name${separator}${JSON.stringify(id)}`));
+      assert.ok(content.includes(`model${separator}${JSON.stringify(model)}`));
+      assert.ok(embeddedPrompt(harness, content).includes(prompt));
+      assert.doesNotMatch(content, /model(?::| = )["']?inherit/);
+    }
   }
 });
 
-test("all generated reviewers preserve the JSON contract and read-only constraints", () => {
+test("all generated reviewers preserve the shared prompt without per-role rewriting", () => {
   const rendered = renderAll();
-
+  const config = JSON.parse(JSON.stringify(
+    renderer.renderRepositoryAgents().skills[0].config,
+  ));
+  const expected = readFileSync(new URL(`../skills/knights-of-the-round-table/${config.prompt}`, import.meta.url), "utf8").trimEnd();
   for (const [harness, files] of Object.entries(rendered)) {
     for (const content of Object.values(files)) {
       const prompt = embeddedPrompt(harness, content);
-      assert.match(prompt, /Review only\. Do not edit files/);
-      assert.match(prompt, /evidence-backed actionable findings/i);
-      assert.match(prompt, /Do not report formatting preferences/);
-      assert.match(prompt, /Return JSON only\./);
-      assert.match(prompt, /"reviewer"/);
-      assert.match(prompt, /"findings"/);
-      assert.match(prompt, /"id": "finding:<stable-slug>"/);
-      assert.match(prompt, /"severity": "critical\|high\|medium\|low"/);
-      assert.match(prompt, /"confidence": 1/);
-      assert.match(prompt, /"file": "relative\/path"/);
-      assert.match(prompt, /"line": 1/);
-      assert.match(prompt, /"title": "Short finding"/);
-      assert.match(prompt, /"evidence": "Concrete evidence"/);
-      assert.match(prompt, /"recommendation": "Specific actionable fix"/);
-      assert.match(prompt, /"status": "open"/);
-      assert.match(prompt, /same stable finding ID across reviewer roles/i);
-      assert.match(prompt, /confidence.*integer from 1 through 10/i);
-      assert.match(prompt, /empty `findings` array/);
+      assert.ok(prompt.includes(expected), `${harness} retains the complete shared prompt`);
     }
   }
 });
@@ -198,7 +174,7 @@ test("harness adapters declare only read-only tools and safely escaped metadata"
   }
   for (const content of Object.values(rendered.claude)) {
     assert.match(content, /tools: Read, Grep, Glob/);
-    assert.match(content, /model: inherit/);
+    assert.match(content, /model: "[^"]+"/);
   }
   for (const content of Object.values(rendered.codex)) {
     assert.match(content, /sandbox_mode = "read-only"/);
@@ -213,39 +189,18 @@ test("harness adapters declare only read-only tools and safely escaped metadata"
     ]) {
       assert.match(content, new RegExp(`  - ${tool}`));
     }
-    assert.match(content, /model: inherit/);
+    assert.match(content, /model: "[^"]+"/);
   }
 
   const escaped = renderAll({
-    config: validConfig({
-      reviewers: [
-        {
-          role: "correctness",
-          prompt: "reviewers/correctness.md",
-          fallbackRole: null,
-          harnesses: {
-            claude: 'quoted: "reviewer"',
-            copilot: 'quoted: "reviewer"',
-            codex: 'quoted: "reviewer"',
-            gemini: 'quoted: "reviewer"',
-          },
-        },
-      ],
-    }),
+    config: validConfig(),
     prompts: {
-      "reviewers/correctness.md": "Line one\nLine \"two\"\\three",
+      "reviewers/whole-panel.md": "Line one\nLine \"two\"\\three",
     },
   });
 
-  assert.match(escaped.copilot['quoted: "reviewer".agent.md'], /name: "quoted: \\"reviewer\\""/);
-  assert.match(escaped.claude['quoted: "reviewer".md'], /name: "quoted: \\"reviewer\\""/);
-  assert.match(escaped.gemini['quoted: "reviewer".md'], /name: "quoted: \\"reviewer\\""/);
   assert.match(
-    escaped.codex['quoted: "reviewer".toml'],
-    /name = "quoted: \\"reviewer\\""/,
-  );
-  assert.match(
-    escaped.codex['quoted: "reviewer".toml'],
+    escaped.codex["correctness-reviewer.toml"],
     /developer_instructions = "Line one\\nLine \\"two\\"\\\\three"/,
   );
 });
@@ -288,32 +243,33 @@ test("renderer check CLI runs correctly when invoked through a symlinked script 
   }
 });
 
-test("renderer rejects duplicate output filenames instead of overwriting", () => {
-  const config = validConfig({
-    reviewers: [
-      {
-        role: "correctness",
-        prompt: "reviewers/correctness.md",
-        fallbackRole: null,
-        harnesses: harnessNames("shared-reviewer"),
-      },
-      {
-        role: "tests",
-        prompt: "reviewers/tests.md",
-        fallbackRole: "correctness",
-        harnesses: harnessNames("shared-reviewer"),
-      },
-    ],
-  });
-
+test("renderer rejects conflicting primary and fallback IDs instead of overwriting", () => {
+  const config = validConfig();
+  config.panels.claude[0].fallback = { id: "correctness-reviewer", model: "different-model" };
   assert.throws(
-    () =>
-      renderer.renderAgents(config, {
-        "reviewers/correctness.md": "Correctness prompt.",
-        "reviewers/tests.md": "Tests prompt.",
-      }),
-    /duplicate output filename for claude: shared-reviewer\.md/,
+    () => renderer.renderAgents(config, { [config.prompt]: "Shared prompt." }),
+    /conflict.*claude.*correctness-reviewer/i,
   );
+});
+
+test("renderer renders configured fallbacks once and deduplicates identical ID/model pairs", () => {
+  const config = validConfig();
+  config.panels.claude = [
+    { id: "primary", model: "primary-model", fallback: { id: "backup", model: "backup-model" } },
+    { id: "second", model: "second-model", fallback: { id: "backup", model: "backup-model" } },
+    { id: "backup", model: "backup-model", fallback: null },
+  ];
+  const rendered = renderer.renderAgents(config, { [config.prompt]: "Shared prompt." });
+  assert.deepEqual(Object.keys(rendered.claude), ["primary.md", "backup.md", "second.md"]);
+  assert.match(rendered.claude["backup.md"], /model: "backup-model"/);
+  assert.ok(Object.values(rendered.claude).every((content) => content.includes("Shared prompt.")));
+});
+
+test("renderer allows unrestricted nonempty panel sizes without inventing inherited models", () => {
+  const config = validConfig();
+  config.panels.gemini = Array.from({ length: 23 }, (_, index) =>
+    ({ id: `reviewer-${index}`, model: `model-${index}`, fallback: null }));
+  assert.equal(Object.keys(renderer.renderAgents(config, { [config.prompt]: "Review." }).gemini).length, 23);
 });
 
 test("invalid empty reviewer config performs no writes or deletions", () => {
@@ -337,9 +293,9 @@ test("invalid empty reviewer config performs no writes or deletions", () => {
       () =>
         renderer.synchronizeGeneratedAgents({
           projectRoot,
-          config: { reviewers: [] },
+          config: validConfig({ panels: { ...validConfig().panels, claude: [] } }),
         }),
-      /reviewers must be a non-empty array/,
+      /claude.*non-empty array/,
     );
     assert.equal(readFileSync(manualPath, "utf8"), "Hand-authored.");
     assert.equal(readFileSync(stalePath, "utf8"), "Previously generated.");
@@ -356,12 +312,12 @@ test("invalid empty reviewer config performs no writes or deletions", () => {
 test("renderer rejects traversal prompts before attempting to read them", () => {
   const projectRoot = createRendererProject();
   const config = validConfig();
-  config.reviewers[0].prompt = "../outside.md";
+  config.prompt = "../outside.md";
 
   try {
     assert.throws(
       () => renderAll({ projectRoot, config }),
-      /reviewers\[0\] prompt must be a safe relative path/,
+      /prompt must be a safe relative path/,
     );
   } finally {
     removeRendererProject(projectRoot);
