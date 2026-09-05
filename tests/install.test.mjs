@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -993,10 +993,22 @@ test("rejects a reviewer agent name that escapes its harness directory before an
       name,
     });
     t.after(() => rmSync(projectRoot, { recursive: true, force: true }));
-    const home = withHome(t);
+    // Use a dedicated container per case (rather than tempDir()'s home
+    // directly under tmpdir()) so that even the worst-case traversal
+    // filename ("../../../pwned.md") resolves to a path inside this
+    // disposable container instead of a shared location like tmpdir()
+    // itself. That lets cleanup remove only the container, never an
+    // unconditionally-computed path outside of it.
+    const container = tempDir("knights-install-traversal-");
+    t.after(() => rmSync(container, { recursive: true, force: true }));
+    const home = join(container, "home");
+    mkdirSync(home, { recursive: true });
     const escapeTarget = resolve(join(home, AGENT_HARNESS_DIRS[harness]), filename);
-    t.after(() => rmSync(escapeTarget, { recursive: true, force: true }));
 
+    assert.ok(
+      escapeTarget === container || escapeTarget.startsWith(container + sep),
+      `${harness} ${name}: escape target must stay inside the disposable container`,
+    );
     assert.equal(existsSync(escapeTarget), false, `${harness} ${name}: precondition`);
 
     assert.throws(
@@ -1324,6 +1336,12 @@ test("CLI accepts --harness all and --force", (t) => {
 
 test("install() rejects an empty home instead of retargeting to the current directory", (t) => {
   const projectRoot = withFixture(t);
+  // install() runs in this test process, so an empty home would resolve
+  // relative to the runner's own cwd (the repository root) if it were not
+  // rejected. Snapshot rather than assume-and-delete: this proves nothing
+  // was created without ever assuming ".claude" was absent beforehand, and
+  // never mutates or removes preexisting repository content.
+  const claudeDirExistedBefore = existsSync(join(repositoryRoot, ".claude"));
 
   assert.throws(
     () =>
@@ -1335,11 +1353,12 @@ test("install() rejects an empty home instead of retargeting to the current dire
     /home/i,
   );
 
-  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), claudeDirExistedBefore);
 });
 
 test("install() rejects a whitespace-only home instead of retargeting to the current directory", (t) => {
   const projectRoot = withFixture(t);
+  const claudeDirExistedBefore = existsSync(join(repositoryRoot, ".claude"));
 
   assert.throws(
     () =>
@@ -1351,33 +1370,37 @@ test("install() rejects a whitespace-only home instead of retargeting to the cur
     /home/i,
   );
 
-  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+  assert.equal(existsSync(join(repositoryRoot, ".claude")), claudeDirExistedBefore);
 });
 
 test("CLI fails clearly on an empty --home value without mutating the current directory", (t) => {
-  t.after(() => rmSync(join(repositoryRoot, ".claude"), { recursive: true, force: true }));
+  // Run with cwd set to a disposable sandbox (never the repository root)
+  // so the assertion and cleanup only ever touch throwaway paths.
+  const sandbox = tempDir("knights-install-cli-empty-home-");
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
   const outcome = spawnSync(
     process.execPath,
-    ["scripts/install.mjs", "--harness", "claude", "--home", ""],
-    { cwd: repositoryRoot, encoding: "utf8" },
+    [join(repositoryRoot, "scripts/install.mjs"), "--harness", "claude", "--home", ""],
+    { cwd: sandbox, encoding: "utf8" },
   );
 
   assert.notEqual(outcome.status, 0);
   assert.match(outcome.stderr, /home/i);
-  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+  assert.equal(existsSync(join(sandbox, ".claude")), false);
 });
 
 test("CLI fails clearly on a whitespace-only --home value without mutating the current directory", (t) => {
-  t.after(() => rmSync(join(repositoryRoot, ".claude"), { recursive: true, force: true }));
+  const sandbox = tempDir("knights-install-cli-whitespace-home-");
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
   const outcome = spawnSync(
     process.execPath,
-    ["scripts/install.mjs", "--harness", "claude", "--home", "   "],
-    { cwd: repositoryRoot, encoding: "utf8" },
+    [join(repositoryRoot, "scripts/install.mjs"), "--harness", "claude", "--home", "   "],
+    { cwd: sandbox, encoding: "utf8" },
   );
 
   assert.notEqual(outcome.status, 0);
   assert.match(outcome.stderr, /home/i);
-  assert.equal(existsSync(join(repositoryRoot, ".claude")), false);
+  assert.equal(existsSync(join(sandbox, ".claude")), false);
 });
