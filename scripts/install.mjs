@@ -172,6 +172,68 @@ function assertValidManifestShape(manifest, manifestPath) {
   }
 }
 
+// Proves a manifest actually belongs to the target it was found in, rather
+// than merely being *some* shape-valid manifest (Gap 1: manifest
+// association is not validated). `assertValidManifestShape` only checks
+// field types, so a manifest copied or forged from another skill or another
+// physical harness group is otherwise indistinguishable from a genuine
+// prior install once shape validation passes -- letting it be treated as
+// proof of ownership, including merging its harnesses or authorizing a
+// forced update. This check runs unconditionally, before the `--force`
+// gate, so a mismatched manifest is refused exactly like any other unowned
+// collision, even with force.
+//
+// - For a skill-install manifest (`exactHarness` omitted), `harnesses` must
+//   be a nonempty, duplicate-free subset of `allowedHarnesses` (that
+//   physical group's allowed harnesses: Claude only, Copilot only, or the
+//   shared Codex/Gemini group). A shared group may legitimately be owned by
+//   either or both harnesses; this only rejects harnesses outside the
+//   group and duplicate/unknown values, so a force install of the sibling
+//   harness still merges correctly.
+// - For an agent-directory manifest (`exactHarness` given), `harnesses`
+//   must be exactly that one harness, nothing more or less.
+// - Either way, `manifest.skill` must equal the skill being installed, and
+//   every file path in `manifest.files` must be unique: a duplicate path
+//   would otherwise silently collapse to a single (attacker-chosen) hash
+//   wherever callers index owned files by path.
+function assertManifestOwnership(
+  manifest,
+  manifestPath,
+  { skill, allowedHarnesses, exactHarness },
+) {
+  if (manifest.skill !== skill) {
+    throw new Error(
+      `Refusing to install: ownership manifest belongs to a different skill: ${manifestPath}`,
+    );
+  }
+
+  const harnesses = manifest.harnesses;
+  if (harnesses.length === 0 || new Set(harnesses).size !== harnesses.length) {
+    throw new Error(
+      `Refusing to install: ownership manifest has invalid harnesses: ${manifestPath}`,
+    );
+  }
+
+  if (exactHarness !== undefined) {
+    if (harnesses.length !== 1 || harnesses[0] !== exactHarness) {
+      throw new Error(
+        `Refusing to install: ownership manifest harness does not match this agent directory: ${manifestPath}`,
+      );
+    }
+  } else if (!harnesses.every((harness) => allowedHarnesses.includes(harness))) {
+    throw new Error(
+      `Refusing to install: ownership manifest references a harness outside this group: ${manifestPath}`,
+    );
+  }
+
+  const filePaths = manifest.files.map((file) => file.path);
+  if (new Set(filePaths).size !== filePaths.length) {
+    throw new Error(
+      `Refusing to install: ownership manifest has duplicate file paths: ${manifestPath}`,
+    );
+  }
+}
+
 function readManifestIfExists(directory) {
   const manifestPath = join(directory, MANIFEST_FILENAME);
   const stat = lstatIfExists(manifestPath);
@@ -302,6 +364,59 @@ function assertSafeAncestors(resolvedHome, targetDir, description) {
         `${description} path component is not a directory: ${current}`,
       );
     }
+  }
+}
+
+// Source-side counterpart to assertSafeAncestors above, used to guard
+// checked-in source directories (Gap 3: generated-agent source directory
+// symlink). `validateGeneratedAgents` used to lstat-check only the final
+// generated agent *files*; it never confirmed that the directory
+// containing them -- e.g. `<projectRoot>/generated/claude/agents` -- was
+// itself a real, non-symlink directory contained within the project root.
+// A symlinked source directory (`generated/claude/agents -> /outside`)
+// would let every per-file lstat/hash check downstream pass, because the
+// files at the far end of the symlink are themselves real, regular files
+// with valid content -- while silently reading (and later installing) them
+// from outside the project root. This checks every path component from the
+// (already-resolved) project root down through the directory itself --
+// unlike assertSafeAncestors, inclusive of the final component, since here
+// the directory being validated is the source of truth, not a destination
+// whose own symlink-ness the caller checks separately -- and confirms the
+// directory's own resolved realpath does not escape the project root
+// either.
+function assertSafeSourceDirectory(realProjectRoot, directory, description) {
+  const relativePath = relative(realProjectRoot, directory);
+  if (
+    relativePath === "" ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error(`${description} escapes the project root: ${directory}`);
+  }
+
+  const segments = relativePath.split(sep);
+  let current = realProjectRoot;
+  for (const segment of segments) {
+    current = join(current, segment);
+    const stat = lstatIfExists(current);
+    if (stat === null) {
+      throw new Error(`${description} does not exist: ${directory}`);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(
+        `${description} path component must not be a symlink: ${current}`,
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(
+        `${description} path component is not a directory: ${current}`,
+      );
+    }
+  }
+
+  const realDirectory = realpathSync(directory);
+  if (!isContainedPath(realProjectRoot, realDirectory)) {
+    throw new Error(`${description} escapes the project root: ${directory}`);
   }
 }
 
@@ -472,7 +587,7 @@ function validateSource({ projectRoot, skill, harnesses }) {
 
   const isKnightsSkill = skill === DEFAULT_SKILL;
   const generatedAgents = isKnightsSkill
-    ? validateGeneratedAgents({ projectRoot: resolvedProjectRoot, harnesses })
+    ? validateGeneratedAgents({ projectRoot: realProjectRoot, harnesses })
     : {};
 
   return {
@@ -489,6 +604,9 @@ function validateSource({ projectRoot, skill, harnesses }) {
 // reviewer config and prompts as a side effect) and confirms that every
 // checked-in generated agent for each selected harness is a regular,
 // non-symlink file whose contents match that render output (item 11).
+// `projectRoot` here must already be a fully resolved realpath (see
+// validateSource), since assertSafeSourceDirectory below measures
+// containment against it directly.
 function validateGeneratedAgents({ projectRoot, harnesses }) {
   const rendered = renderAll({ projectRoot });
   const result = {};
@@ -497,6 +615,11 @@ function validateGeneratedAgents({ projectRoot, harnesses }) {
     const directory = resolve(
       projectRoot,
       GENERATED_AGENT_SOURCE_DIRS[harness],
+    );
+    assertSafeSourceDirectory(
+      projectRoot,
+      directory,
+      `Generated reviewer agent source directory for ${harness}`,
     );
     const files = [];
     for (const [filename, expectedContent] of Object.entries(
@@ -553,7 +676,7 @@ function mergedHarnesses(existingHarnesses, selectedHarnesses, allowedHarnesses)
 // Throws (refusing to mutate anything) unless the directory is missing, or
 // it is fully owned by a valid prior manifest, every listed file's hash
 // still matches, and `force` was passed (items 8, 9, 10).
-function preflightSkillGroup({ targetDir, force }) {
+function preflightSkillGroup({ targetDir, skill, allowedHarnesses, force }) {
   const stat = lstatIfExists(targetDir);
   if (stat === null) {
     return { existed: false, priorHarnesses: [] };
@@ -575,6 +698,10 @@ function preflightSkillGroup({ targetDir, force }) {
       `Refusing to install: an unmanaged path already exists: ${targetDir}`,
     );
   }
+  assertManifestOwnership(manifestResult.manifest, manifestResult.manifestPath, {
+    skill,
+    allowedHarnesses,
+  });
 
   const actualFiles = walkExistingDestinationFiles(targetDir);
   const manifestFiles = manifestResult.manifest.files
@@ -606,7 +733,7 @@ function preflightSkillGroup({ targetDir, force }) {
 // owned agent cleanup). A stale file is only ever scheduled for deletion
 // once it has been confirmed to still match the hash recorded for it in the
 // prior manifest; any drift causes a hard refusal instead.
-function preflightAgentGroup({ targetDir, harness, requiredFilenames, force }) {
+function preflightAgentGroup({ targetDir, harness, skill, requiredFilenames, force }) {
   const stat = lstatIfExists(targetDir);
   if (stat !== null) {
     if (stat.isSymbolicLink()) {
@@ -622,6 +749,12 @@ function preflightAgentGroup({ targetDir, harness, requiredFilenames, force }) {
   }
 
   const manifestResult = readManifestIfExists(targetDir);
+  if (manifestResult.exists) {
+    assertManifestOwnership(manifestResult.manifest, manifestResult.manifestPath, {
+      skill,
+      exactHarness: harness,
+    });
+  }
   const ownedHashes = new Map();
   if (manifestResult.exists) {
     for (const file of manifestResult.manifest.files) {
@@ -630,7 +763,14 @@ function preflightAgentGroup({ targetDir, harness, requiredFilenames, force }) {
   }
 
   const requiredSet = new Set(requiredFilenames);
-  let hasOwnedCollision = false;
+  // A valid, correctly-scoped manifest already existing at this target
+  // means there was a prior install here, even if every payload file it
+  // lists has since been removed by hand (Gap 2: no-force partial-owned
+  // agent install). The per-file loops below only ever *upgrade* this to
+  // true on a hash match; without this seed, an owner whose files were all
+  // deleted but whose manifest survived would see no collision at all and
+  // proceed without --force.
+  let hasOwnedCollision = manifestResult.exists;
 
   for (const filename of requiredFilenames) {
     const filePath = resolveSafeAgentFilePath(
@@ -837,6 +977,8 @@ export function install(options = {}) {
     assertSafeAncestors(resolvedHome, group.targetDir, "Skill destination");
     const { existed, priorHarnesses } = preflightSkillGroup({
       targetDir: group.targetDir,
+      skill,
+      allowedHarnesses: group.harnesses,
       force,
     });
     return {
@@ -859,6 +1001,7 @@ export function install(options = {}) {
     const { staleFilenames } = preflightAgentGroup({
       targetDir: agentGroup.targetDir,
       harness: agentGroup.harness,
+      skill,
       requiredFilenames: agentGroup.files.map((file) => file.filename),
       force,
     });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -564,6 +565,174 @@ test("refuses an unmanaged agent file collision even with force", (t) => {
   );
 });
 
+// Gap 1: manifest association is not validated. A manifest that is
+// shape-valid (right types, right schema version) but was copied or forged
+// from another skill or another physical harness group must not be treated
+// as proof of ownership over *this* target -- not even with --force. These
+// tests hand-craft such a manifest directly (no `install()` call produced
+// it) to prove the installer authenticates *context*, not just shape.
+test("refuses a skill-install manifest whose skill or harnesses don't match this target, even with force, without mutating anything", (t) => {
+  const projectRoot = withFixture(t);
+  const fileContent = "forged skill md\n";
+  const fileHash = sha256(Buffer.from(fileContent));
+
+  const scenarios = [
+    { label: "wrong skill", skill: "some-other-skill", harnesses: ["claude"] },
+    {
+      label: "harness outside this physical group",
+      skill: "knights-of-the-round-table",
+      harnesses: ["codex"],
+    },
+    {
+      label: "duplicate harness values",
+      skill: "knights-of-the-round-table",
+      harnesses: ["claude", "claude"],
+    },
+    {
+      label: "unknown harness value",
+      skill: "knights-of-the-round-table",
+      harnesses: ["banana"],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const home = withHome(t);
+    const targetDir = join(
+      home,
+      ".claude/skills/knights-of-the-round-table",
+    );
+    const forgedManifest = {
+      schemaVersion: 1,
+      installer: "knights-install",
+      skill: scenario.skill,
+      skillVersion: "0.1.0",
+      source: "/fake/source",
+      harnesses: scenario.harnesses,
+      files: [{ path: "SKILL.md", sha256: fileHash }],
+    };
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(targetDir, "SKILL.md"), fileContent);
+    writeFileSync(
+      join(targetDir, ".knights-install.json"),
+      `${JSON.stringify(forgedManifest, null, 2)}\n`,
+    );
+
+    assert.throws(
+      () =>
+        install({ projectRoot, home, harnesses: ["claude"], force: true }),
+      /ownership manifest/i,
+      scenario.label,
+    );
+
+    assert.equal(
+      readFileSync(join(targetDir, "SKILL.md"), "utf8"),
+      fileContent,
+      `${scenario.label}: forged file must be untouched`,
+    );
+    assert.deepEqual(
+      readManifest(targetDir),
+      forgedManifest,
+      `${scenario.label}: forged manifest must be untouched`,
+    );
+  }
+});
+
+test("refuses an agent-directory manifest whose skill or harness don't match this target, even with force, without mutating anything", (t) => {
+  const projectRoot = withFixture(t);
+  const fileContent = "---\nname: forged\n---\nforged agent body\n";
+  const fileHash = sha256(Buffer.from(fileContent));
+
+  const scenarios = [
+    { label: "wrong skill", skill: "some-other-skill", harnesses: ["claude"] },
+    {
+      label: "harness not exactly this agent directory's harness",
+      skill: "knights-of-the-round-table",
+      harnesses: ["codex"],
+    },
+    {
+      label: "more than the exact single harness",
+      skill: "knights-of-the-round-table",
+      harnesses: ["claude", "codex"],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const home = withHome(t);
+    const targetDir = join(home, ".claude/agents");
+    const forgedManifest = {
+      schemaVersion: 1,
+      installer: "knights-install",
+      skill: scenario.skill,
+      skillVersion: "0.1.0",
+      source: "/fake/source",
+      harnesses: scenario.harnesses,
+      files: [{ path: "security-reviewer.md", sha256: fileHash }],
+    };
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(targetDir, "security-reviewer.md"), fileContent);
+    writeFileSync(
+      join(targetDir, ".knights-install.json"),
+      `${JSON.stringify(forgedManifest, null, 2)}\n`,
+    );
+
+    assert.throws(
+      () =>
+        install({ projectRoot, home, harnesses: ["claude"], force: true }),
+      /ownership manifest/i,
+      scenario.label,
+    );
+
+    assert.equal(
+      readFileSync(join(targetDir, "security-reviewer.md"), "utf8"),
+      fileContent,
+      `${scenario.label}: forged file must be untouched`,
+    );
+    assert.deepEqual(
+      readManifest(targetDir),
+      forgedManifest,
+      `${scenario.label}: forged manifest must be untouched`,
+    );
+  }
+});
+
+test("refuses an agent-directory manifest with duplicate file paths, even with force, without mutating anything", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const targetDir = join(home, ".claude/agents");
+  const fileContent = "---\nname: forged\n---\nforged agent body\n";
+  const fileHash = sha256(Buffer.from(fileContent));
+
+  const forgedManifest = {
+    schemaVersion: 1,
+    installer: "knights-install",
+    skill: "knights-of-the-round-table",
+    skillVersion: "0.1.0",
+    source: "/fake/source",
+    harnesses: ["claude"],
+    files: [
+      { path: "security-reviewer.md", sha256: fileHash },
+      { path: "security-reviewer.md", sha256: fileHash },
+    ],
+  };
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(join(targetDir, "security-reviewer.md"), fileContent);
+  writeFileSync(
+    join(targetDir, ".knights-install.json"),
+    `${JSON.stringify(forgedManifest, null, 2)}\n`,
+  );
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"], force: true }),
+    /ownership manifest/i,
+  );
+
+  assert.equal(
+    readFileSync(join(targetDir, "security-reviewer.md"), "utf8"),
+    fileContent,
+  );
+  assert.deepEqual(readManifest(targetDir), forgedManifest);
+});
+
 // Rewrites the checked-in generated/<harness>/agents directory to match the
 // project's current reviewer config, removing any file that is no longer
 // part of the rendered set. Mirrors what a real repository update (a role
@@ -657,6 +826,58 @@ test("force update removes a stale owned agent file, preserves unrelated files, 
   );
 });
 
+// Gap 2: no-force partial-owned agent install. If the skill directory and
+// every owned agent payload file are removed by hand but the valid,
+// correctly-scoped agent manifest survives, that manifest alone still
+// proves a prior install happened here -- so a reinstall without --force
+// must refuse exactly as it would if the files were still present, and
+// --force recovery must still work.
+test("refuses a no-force reinstall when only the owned agent manifest remains after the skill dir and payload files are removed by hand", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+
+  install({ projectRoot, home, harnesses: ["claude"] });
+
+  const skillDir = join(home, ".claude/skills/knights-of-the-round-table");
+  const agentsDir = join(home, ".claude/agents");
+  const agentManifestBefore = readManifest(agentsDir);
+
+  // Remove the skill install entirely, and every owned agent payload file,
+  // but leave the agent directory's ownership manifest untouched.
+  rmSync(skillDir, { recursive: true, force: true });
+  for (const file of agentManifestBefore.files) {
+    rmSync(join(agentsDir, file.path), { force: true });
+  }
+  assert.equal(existsSync(skillDir), false, "precondition");
+  for (const file of agentManifestBefore.files) {
+    assert.equal(
+      existsSync(join(agentsDir, file.path)),
+      false,
+      `precondition: ${file.path}`,
+    );
+  }
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"] }),
+    /already installed/i,
+  );
+
+  // Nothing changed: the skill dir is still absent, the agent manifest is
+  // exactly as it was, and no payload file was recreated.
+  assert.equal(existsSync(skillDir), false);
+  assert.deepEqual(readManifest(agentsDir), agentManifestBefore);
+  for (const file of agentManifestBefore.files) {
+    assert.equal(existsSync(join(agentsDir, file.path)), false, file.path);
+  }
+
+  // --force recovery remains possible.
+  install({ projectRoot, home, harnesses: ["claude"], force: true });
+  assert.equal(existsSync(join(skillDir, "SKILL.md")), true);
+  for (const file of agentManifestBefore.files) {
+    assert.equal(existsSync(join(agentsDir, file.path)), true, file.path);
+  }
+});
+
 test("invalid source (missing version metadata) leaves home unmodified", (t) => {
   const projectRoot = withFixture(t);
   const home = withHome(t);
@@ -709,6 +930,40 @@ test("invalid source (symlinked skill file) leaves home unmodified", (t) => {
 
   assert.deepEqual(listEntries(home), []);
   rmSync(externalFile, { recursive: true, force: true });
+});
+
+// Gap 3: generated-agent source directory symlink. `validateGeneratedAgents`
+// lstat-checks the final generated agent *files* but never checked whether
+// the directory that contains them is itself a symlink. If
+// `<projectRoot>/generated/claude/agents` is replaced with a directory
+// symlink pointing outside the project root, every per-file lstat/hash
+// check downstream still passes (the files at the far end are real,
+// regular files with valid content) while silently reading from outside
+// the project root -- before any destination mutation.
+test("rejects a symlinked generated-agent source directory before any destination mutation, without mutating the external directory", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  const external = tempDir("knights-install-external-generated-");
+  t.after(() => rmSync(external, { recursive: true, force: true }));
+
+  const sourceDir = join(projectRoot, "generated/claude/agents");
+  const movedDir = join(external, "agents");
+  // Move the *valid* generated agent directory outside the fixture...
+  cpSync(sourceDir, movedDir, { recursive: true });
+  rmSync(sourceDir, { recursive: true, force: true });
+  // ...and replace it with a directory symlink pointing there.
+  symlinkSync(movedDir, sourceDir);
+
+  const externalEntriesBefore = readdirSync(movedDir).sort();
+
+  assert.throws(
+    () => install({ projectRoot, home, harnesses: ["claude"] }),
+    /symlink/i,
+  );
+
+  assert.deepEqual(listEntries(home), []);
+  assert.equal(lstatSync(sourceDir).isSymbolicLink(), true);
+  assert.deepEqual(readdirSync(movedDir).sort(), externalEntriesBefore);
 });
 
 test("rejects a reviewer agent name that escapes its harness directory before any destination mutation", (t) => {
