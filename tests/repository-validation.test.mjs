@@ -105,11 +105,12 @@ function addReviewerSkill(root, name = "second-skill") {
   return config;
 }
 
-function refreshClaudeManifest(root) {
-  editJson(root, manifestPaths[0], (manifest) => {
-    manifest.agents = Object.keys(renderRepositoryAgents({ projectRoot: root }).rendered.claude)
-      .sort().map((file) => `./generated/claude/agents/${file}`);
-  });
+function assertClaudeManifest(root) {
+  const expected = Object.keys(renderRepositoryAgents({ projectRoot: root }).rendered.claude)
+    .sort().map((file) => `./generated/claude/agents/${file}`);
+  assert.deepEqual(JSON.parse(readFileSync(join(root, manifestPaths[0]), "utf8")).agents, expected);
+  assert.deepEqual(readdirSync(join(root, "generated/claude/agents")).sort(),
+    expected.map((path) => path.split("/").at(-1)));
 }
 
 const canonicalCounts = { claude: 3, copilot: 4, codex: 2, gemini: 2 };
@@ -481,7 +482,7 @@ test("accepts a replacement panel with no fixed canonical role or reviewer count
   config.panels.claude = [{ id: "replacement", model: "replacement-model", fallback: null }];
   write(root, path, YAML.stringify(config));
   synchronizeGeneratedAgents({ projectRoot: root });
-  refreshClaudeManifest(root);
+  assertClaudeManifest(root);
   assert.deepEqual(validate(root).errors, []);
 });
 
@@ -502,14 +503,58 @@ test("Claude manifest includes configured fallbacks and rejects unrendered Markd
   const config = YAML.parse(readFileSync(join(root, configPath), "utf8"));
   config.panels.claude[0].fallback = { id: "backup-reviewer", model: "backup-model" };
   write(root, configPath, YAML.stringify(config));
-  synchronizeGeneratedAgents({ projectRoot: root });
   expectInvalid(root, /Claude agents file list/);
-  refreshClaudeManifest(root);
+  synchronizeGeneratedAgents({ projectRoot: root });
+  assertClaudeManifest(root);
   assert.deepEqual(validate(root).errors, []);
   write(root, "generated/claude/agents/manual.md", "---\nname: manual\n---\nManual agent.");
   editJson(root, manifestPaths[0], (manifest) => manifest.agents.push("./generated/claude/agents/manual.md"));
   expectInvalid(root, /Claude agents file list/);
 });
+
+for (const mutation of ["add", "remove", "rename", "fallback", "remove fallback", "rename fallback"]) {
+  test(`canonical Claude config ${mutation} synchronizes registration and native validation`, async (t) => {
+    const root = fixture(t);
+    const configPath = `${skillPath}/config/reviewers.yaml`;
+    const config = YAML.parse(readFileSync(join(root, configPath), "utf8"));
+    if (mutation.includes("fallback")) {
+      config.panels.claude[0].fallback = { id: "original-backup", model: "sonnet" };
+      write(root, configPath, YAML.stringify(config));
+      synchronizeGeneratedAgents({ projectRoot: root });
+    }
+    if (mutation === "add") config.panels.claude.push({ id: "additional-reviewer", model: "opus", fallback: null });
+    if (mutation === "remove") config.panels.claude.pop();
+    if (mutation === "rename") config.panels.claude[0].id = "renamed-reviewer";
+    if (mutation === "fallback") config.panels.claude[1].fallback = { id: "additional-backup", model: "haiku" };
+    if (mutation === "remove fallback") config.panels.claude[0].fallback = null;
+    if (mutation === "rename fallback") config.panels.claude[0].fallback.id = "renamed-backup";
+    write(root, configPath, YAML.stringify(config));
+    const before = readFileSync(join(root, manifestPaths[0]), "utf8");
+    assert.ok(synchronizeGeneratedAgents({ projectRoot: root, check: true }).drift.includes(manifestPaths[0]));
+    assert.equal(readFileSync(join(root, manifestPaths[0]), "utf8"), before);
+    synchronizeGeneratedAgents({ projectRoot: root });
+    assertClaudeManifest(root);
+    const { agents: beforeAgents, ...beforeFields } = JSON.parse(before);
+    const { agents: afterAgents, ...afterFields } = JSON.parse(readFileSync(join(root, manifestPaths[0]), "utf8"));
+    assert.notDeepEqual(afterAgents, beforeAgents);
+    assert.deepEqual(afterFields, beforeFields);
+    assert.deepEqual(validate(root).errors, []);
+    assert.deepEqual(synchronizeGeneratedAgents({ projectRoot: root, check: true }).drift, []);
+    await t.test("installed Claude validates the synchronized manifest without inference", (t) => {
+      if (spawnSync("claude", ["--version"], { encoding: "utf8", timeout: 15000 }).status !== 0) {
+        return t.skip("Claude CLI is not installed");
+      }
+      const home = mkdtempSync(join(tmpdir(), "renderer-native-"));
+      t.after(() => rmSync(home, { recursive: true, force: true }));
+      const native = spawnSync("claude", ["plugin", "validate", join(root, manifestPaths[0]), "--json"], {
+        cwd: home, encoding: "utf8", timeout: 20000,
+        env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: home, CLAUDE_CONFIG_DIR: join(home, ".claude") },
+      });
+      assert.equal(native.status, 0, native.stderr + native.stdout);
+      assert.equal(JSON.parse(native.stdout).success, true);
+    });
+  });
+}
 
 for (const missingConfig of ["removed", "renamed"]) {
   for (const check of [false, true]) {
@@ -629,6 +674,7 @@ test("repository render CLI writes and checks all agents across two skills", (t)
   assert.equal(rendered.status, 0, rendered.stderr);
   assert.equal(rendered.stdout.trim(), `Rendered ${canonicalAgentCount + 4} reviewer agents.`);
   assert.equal(rendered.stderr, "");
+  assertClaudeManifest(root);
   const after = generatedSnapshot(root, null);
   assert.equal(Object.keys(after).length, canonicalAgentCount + 5, "all agents plus ownership");
   const current = run("--check");
@@ -663,7 +709,7 @@ test("validates and renders reviewers belonging to another skill without Knights
 
   const result = synchronizeGeneratedAgents({ projectRoot: root });
   assert.equal(result.fileCount, canonicalAgentCount + 4, "renderer must generate both skills' agents");
-  refreshClaudeManifest(root);
+  assertClaudeManifest(root);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   assert.deepEqual(manifest, {
     version: 1, files: [...canonicalPaths, ...extraPaths].sort(),

@@ -39,15 +39,19 @@ export function createSnapshot(repositoryRoot, { artifacts = [] } = {}) {
   const capture = () => {
     const head = git("rev-parse", "--verify", "HEAD").trim();
     const index = git("ls-files", "--stage", "-z");
-    if (index.split("\0").some(entry => /^160000 /.test(entry))) {
+    const indexEntries = index.split("\0").filter(Boolean);
+    if (indexEntries.some(entry => /^160000 /.test(entry))) {
       throw new Error("submodule review surfaces are unsupported; one repository per invocation");
     }
+    const trackedPaths = new Set(indexEntries.map(entry => entry.slice(entry.indexOf("\t") + 1)));
     const paths = [...new Set([
-      ...git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean),
+      ...trackedPaths,
+      ...git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean),
       ...artifacts,
     ])].sort();
     const files = paths.map(path => {
       if (!isSafeRelativePath(path) || path.split("/").includes(".git")) throw new Error(`unsafe snapshot path: ${JSON.stringify(path)}`);
+      const isArtifact = artifacts.includes(path);
       // Never traverse a parent symlink, even for explicit ignored artifacts.
       const parts = path.split("/");
       let parent = root;
@@ -55,16 +59,24 @@ export function createSnapshot(repositoryRoot, { artifacts = [] } = {}) {
         parent = resolve(parent, part);
         const stats = lstatSync(parent, { throwIfNoEntry: false });
         if (stats?.isSymbolicLink()) throw new Error(`snapshot path traverses a symlink: ${path}`);
+        // A normal file replacing an indexed directory makes its old children
+        // deleted. Its replacement bytes are captured via the untracked list.
+        if (stats?.isFile()) {
+          if (isArtifact) throw new Error(`task artifact is missing: ${path}`);
+          if (trackedPaths.has(path)) return [path, "deleted"];
+        }
+        if (stats && !stats.isDirectory()) throw new Error(`snapshot requires directory parents: ${path}`);
       }
       const fullPath = resolve(root, path), stats = lstatSync(fullPath, { throwIfNoEntry: false });
       if (!stats) {
-        if (artifacts.includes(path)) throw new Error(`task artifact is missing: ${path}`);
+        if (isArtifact) throw new Error(`task artifact is missing: ${path}`);
         return [path, "deleted"];
       }
       if (stats.isSymbolicLink()) {
-        if (artifacts.includes(path)) throw new Error(`task artifact must not be a symlink: ${path}`);
+        if (isArtifact) throw new Error(`task artifact must not be a symlink: ${path}`);
         return [path, "symlink", readlinkSync(fullPath)];
       }
+      if (stats.isDirectory() && trackedPaths.has(path) && !isArtifact) return [path, "deleted"];
       if (!stats.isFile()) throw new Error(`snapshot requires regular files (not nested repositories): ${path}`);
       return [path, stats.mode & 0o777, fileDigest(fullPath)];
     });

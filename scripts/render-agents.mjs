@@ -21,6 +21,7 @@ const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CONFIG_RELATIVE_PATH = "config/reviewers.yaml";
 const DEFAULT_SKILL_DIRECTORY = "skills/knights-of-the-round-table";
 const MANIFEST_FILENAME = ".generated-agents.json";
+const CLAUDE_MANIFEST_PATH = ".claude-plugin/plugin.json";
 const HARNESS_DIRECTORIES = {
   claude: "generated/claude/agents",
   copilot: "agents",
@@ -432,7 +433,29 @@ function loadOwnershipManifest(projectRoot) {
   return { exists: true, files, contents };
 }
 
-function findDrift(projectRoot, rendered, manifest) {
+function loadClaudeManifest(projectRoot, rendered) {
+  const root = resolve(projectRoot);
+  const path = resolve(root, CLAUDE_MANIFEST_PATH);
+  if (lstatIfExists(dirname(path))?.isSymbolicLink()) {
+    throw new Error("Claude plugin manifest directory must not be a symlink");
+  }
+  assertWritableFileTarget(root, realpathSync(root), path,
+    "Claude plugin manifest target", CLAUDE_MANIFEST_PATH);
+  // The renderer owns only agents, never the plugin's other metadata.
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error(`${CLAUDE_MANIFEST_PATH} must contain a JSON object`);
+  }
+  const agents = Object.keys(rendered.claude).sort()
+    .map((filename) => `./${HARNESS_DIRECTORIES.claude}/${filename}`);
+  return {
+    path,
+    drifted: JSON.stringify(manifest.agents) !== JSON.stringify(agents),
+    contents: `${JSON.stringify({ ...manifest, agents }, null, 2)}\n`,
+  };
+}
+
+function findDrift(projectRoot, rendered, manifest, claudeManifest) {
   const drift = [];
   const expectedFiles = expectedOwnedPaths(rendered);
   const expectedFileSet = new Set(expectedFiles);
@@ -458,6 +481,9 @@ function findDrift(projectRoot, rendered, manifest) {
     manifest.contents !== serializeManifest(expectedFiles)
   ) {
     drift.push(MANIFEST_FILENAME);
+  }
+  if (claudeManifest.drifted) {
+    drift.push(CLAUDE_MANIFEST_PATH);
   }
 
   for (const ownedPath of manifest.files) {
@@ -550,12 +576,22 @@ function synchronizeOwnedOutputs(projectRoot, rendered, manifest) {
   );
 }
 
+function assertNoUnownedOutputCollisions(projectRoot, rendered, manifest) {
+  const ownedPaths = new Set(manifest.files);
+  for (const path of expectedOwnedPaths(rendered)) {
+    if (!ownedPaths.has(path) && lstatIfExists(ownedOutputPath(projectRoot, path)) !== null) {
+      throw new Error(`Refusing to overwrite unowned generated output: ${path}`);
+    }
+  }
+}
+
 // Read-only verification also accepts rendered agents collected from multiple skills.
 export function checkGeneratedAgents(rendered, { projectRoot = DEFAULT_PROJECT_ROOT } = {}) {
   assertOutputPathsSafe(projectRoot, rendered);
   const manifest = loadOwnershipManifest(projectRoot);
+  const claudeManifest = loadClaudeManifest(projectRoot, rendered);
   return {
-    drift: findDrift(projectRoot, rendered, manifest),
+    drift: findDrift(projectRoot, rendered, manifest, claudeManifest),
     fileCount: Object.values(rendered).reduce(
       (count, files) => count + Object.keys(files).length,
       0,
@@ -580,7 +616,8 @@ export function synchronizeGeneratedAgents(options = {}) {
     rendered,
   );
   const manifest = loadOwnershipManifest(projectRoot);
-  const drift = findDrift(projectRoot, rendered, manifest);
+  const claudeManifest = loadClaudeManifest(projectRoot, rendered);
+  const drift = findDrift(projectRoot, rendered, manifest, claudeManifest);
   const fileCount = Object.values(rendered).reduce(
     (count, files) => count + Object.keys(files).length,
     0,
@@ -592,7 +629,11 @@ export function synchronizeGeneratedAgents(options = {}) {
     rendered,
     manifest,
   );
+  assertNoUnownedOutputCollisions(projectRoot, rendered, manifest);
   synchronizeOwnedOutputs(projectRoot, rendered, manifest);
+  if (claudeManifest.drifted) {
+    writeFileSync(claudeManifest.path, claudeManifest.contents);
+  }
 
   return { drift, fileCount };
 }

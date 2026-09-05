@@ -175,6 +175,94 @@ test("snapshot includes explicit ignored task artifacts and rejects paths escapi
   symlinkSync(tmpdir(), join(root, "escape"));
   assert.throws(() => runtime.createSnapshot(root, { artifacts: ["escape/a"] }));
 });
+
+for (const replacement of ["file-to-directory", "directory-to-file"]) {
+  for (const staged of [false, true]) {
+    test(`snapshot fingerprints ${staged ? "staged" : "unstaged"} ${replacement} replacements`, t => {
+      const { root, git } = repository(t);
+      const path = join(root, "tracked");
+      const child = join(path, "nested/child");
+      if (replacement === "directory-to-file") {
+        rmSync(path);
+        mkdirSync(join(path, "nested"), { recursive: true });
+        writeFileSync(child, "original child");
+        git("add", "-A"); git("commit", "-qm", "directory baseline");
+      }
+      const clean = runtime.createSnapshot(root).digest;
+      rmSync(path, { recursive: true });
+      if (replacement === "file-to-directory") {
+        mkdirSync(join(path, "nested"), { recursive: true });
+        writeFileSync(child, "replacement child");
+      } else {
+        writeFileSync(path, "replacement file");
+      }
+      if (staged) git("add", "-A");
+      const beforeStatus = git("status", "--porcelain=v1", "-uall");
+      const beforeIndex = git("ls-files", "--stage", "-z");
+      const replaced = runtime.createSnapshot(root).digest;
+      assert.notEqual(replaced, clean);
+      assert.equal(runtime.createSnapshot(root).digest, replaced);
+      assert.equal(git("status", "--porcelain=v1", "-uall"), beforeStatus);
+      assert.equal(git("ls-files", "--stage", "-z"), beforeIndex);
+      const replacementPath = replacement === "file-to-directory" ? child : path;
+      writeFileSync(replacementPath, "changed replacement bytes");
+      const changed = runtime.createSnapshot(root).digest;
+      assert.notEqual(changed, replaced, "replacement content must be fingerprinted independently of deleted index paths");
+      git("add", "-A");
+      const stagedChange = runtime.createSnapshot(root).digest;
+      assert.notEqual(stagedChange, changed, "staging must remain part of the snapshot");
+      writeFileSync(replacementPath, "new dirty replacement bytes");
+      assert.notEqual(runtime.createSnapshot(root).digest, stagedChange);
+      const obsoleteArtifact = replacement === "file-to-directory" ? "tracked" : "tracked/nested/child";
+      assert.throws(() => runtime.createSnapshot(root, { artifacts: [obsoleteArtifact] }),
+        /artifact|regular files|ENOTDIR/);
+    });
+  }
+}
+
+test("snapshot rejects explicit replaced tracked artifacts before staging", t => {
+  const { root, git } = repository(t);
+  rmSync(join(root, "tracked"));
+  mkdirSync(join(root, "tracked"));
+  writeFileSync(join(root, "tracked/child"), "child");
+  assert.throws(() => runtime.createSnapshot(root, { artifacts: ["tracked"] }), /artifact|regular files/);
+  git("add", "-A"); git("commit", "-qm", "directory");
+  rmSync(join(root, "tracked"), { recursive: true });
+  writeFileSync(join(root, "tracked"), "replacement");
+  assert.throws(() => runtime.createSnapshot(root, { artifacts: ["tracked/child"] }), /artifact|ENOTDIR/);
+});
+
+test("snapshot never treats parent symlinks or nonregular replacements as tracked deletions", t => {
+  const { root, git } = repository(t);
+  mkdirSync(join(root, "directory/nested"), { recursive: true });
+  writeFileSync(join(root, "directory/nested/child"), "child");
+  git("add", "-A"); git("commit", "-qm", "directory");
+  rmSync(join(root, "directory"), { recursive: true });
+  symlinkSync(tmpdir(), join(root, "directory"));
+  assert.throws(() => runtime.createSnapshot(root), /symlink/);
+  rmSync(join(root, "directory"));
+  execFileSync("mkfifo", [join(root, "directory")]);
+  assert.throws(() => runtime.createSnapshot(root), /regular|directory/);
+  rmSync(join(root, "directory"));
+  rmSync(join(root, "tracked"));
+  execFileSync("mkfifo", [join(root, "tracked")]);
+  assert.throws(() => runtime.createSnapshot(root), /regular/);
+});
+
+test("snapshot propagates filesystem access errors instead of recording tracked deletions", t => {
+  if (process.getuid?.() === 0) return t.skip("root bypasses directory permissions");
+  const { root, git } = repository(t);
+  const directory = join(root, "restricted");
+  mkdirSync(directory);
+  writeFileSync(join(directory, "child"), "child");
+  git("add", "-A"); git("commit", "-qm", "restricted directory");
+  chmodSync(directory, 0);
+  try {
+    assert.throws(() => runtime.createSnapshot(root), { code: "EACCES" });
+  } finally {
+    chmodSync(directory, 0o755);
+  }
+});
 test("CLI accepts a clean final round at the cap but rejects its snapshot after changes", t => {
   const { root } = repository(t);
   const script = new URL("../skills/knights-of-the-round-table/scripts/review-round.mjs", import.meta.url).pathname;

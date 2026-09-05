@@ -53,6 +53,9 @@ function createRendererProject() {
   );
   mkdirSync(promptDirectory, { recursive: true });
   writeFileSync(join(promptDirectory, "whole-panel.md"), "Review only.");
+  mkdirSync(join(projectRoot, ".claude-plugin"));
+  cpSync(new URL("../.claude-plugin/plugin.json", import.meta.url),
+    join(projectRoot, ".claude-plugin/plugin.json"));
   return projectRoot;
 }
 
@@ -63,6 +66,7 @@ function removeRendererProject(projectRoot) {
 function createRendererCliProject() {
   const projectRoot = mkdtempSync(join(tmpdir(), "reviewer-renderer-cli-"));
   const fixturePaths = [
+    ".claude-plugin/plugin.json",
     "scripts/render-agents.mjs",
     "scripts/is-main-module.mjs",
     "skills/knights-of-the-round-table/scripts/parse-yaml.mjs",
@@ -613,4 +617,73 @@ test("check mode succeeds when current and fails when a generated file drifts", 
   } finally {
     removeRendererProject(projectRoot);
   }
+});
+
+test("CLI detects and repairs manifest-only drift while preserving unrelated plugin fields", (t) => {
+  const projectRoot = createRendererCliProject();
+  t.after(() => removeRendererProject(projectRoot));
+  renderer.synchronizeGeneratedAgents({ projectRoot });
+  const path = join(projectRoot, ".claude-plugin/plugin.json");
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  const expectedAgents = manifest.agents;
+  const unrelated = { ...manifest, author: { name: "Fixture" }, custom: { nested: [1, true] } };
+  delete unrelated.agents;
+  writeFileSync(path, JSON.stringify({ ...unrelated, agents: [] }));
+  const before = readFileSync(path, "utf8");
+
+  const drifted = runRenderer(projectRoot, "--check");
+  assert.equal(drifted.status, 1);
+  assert.match(drifted.stderr, /\.claude-plugin\/plugin\.json/);
+  assert.equal(readFileSync(path, "utf8"), before);
+  const repaired = runRenderer(projectRoot);
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { ...unrelated, agents: expectedAgents });
+  assert.equal(runRenderer(projectRoot, "--check").status, 0);
+});
+
+for (const target of ["file symlink", "directory symlink", "directory", "invalid JSON", "array", "null", "missing"]) {
+  test(`renderer rejects unsafe Claude manifest (${target}) before writes in both modes`, (t) => {
+    const projectRoot = createRendererProject();
+    const externalRoot = createRendererProject();
+    t.after(() => removeRendererProject(projectRoot));
+    t.after(() => removeRendererProject(externalRoot));
+    const path = join(projectRoot, ".claude-plugin/plugin.json");
+    const externalPath = join(externalRoot, ".claude-plugin/plugin.json");
+    const before = readFileSync(externalPath, "utf8");
+    if (target === "directory symlink") {
+      rmSync(join(projectRoot, ".claude-plugin"), { recursive: true });
+      symlinkSync(join(externalRoot, ".claude-plugin"), join(projectRoot, ".claude-plugin"));
+    } else {
+      unlinkSync(path);
+      if (target === "file symlink") symlinkSync(externalPath, path);
+      if (target === "directory") mkdirSync(path);
+      if (target === "invalid JSON") writeFileSync(path, "{");
+      if (target === "array") writeFileSync(path, "[]");
+      if (target === "null") writeFileSync(path, "null");
+    }
+    for (const check of [true, false]) {
+      assert.throws(() => renderer.synchronizeGeneratedAgents({
+        projectRoot, config: validConfig(), check,
+      }), /symlink|regular file|JSON|object|ENOENT/);
+      assert.equal(existsSync(join(projectRoot, "agents")), false);
+      assert.equal(existsSync(join(projectRoot, ".generated-agents.json")), false);
+      assert.equal(readFileSync(externalPath, "utf8"), before);
+    }
+  });
+}
+
+test("renderer refuses an unowned output collision before changing the Claude manifest", (t) => {
+  const projectRoot = createRendererProject();
+  t.after(() => removeRendererProject(projectRoot));
+  const path = join(projectRoot, "generated/claude/agents/correctness-reviewer.md");
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "Hand-authored agent.");
+  const manifestPath = join(projectRoot, ".claude-plugin/plugin.json");
+  const before = readFileSync(manifestPath, "utf8");
+  assert.throws(() => renderer.synchronizeGeneratedAgents({
+    projectRoot, config: validConfig(),
+  }), /unowned/i);
+  assert.equal(readFileSync(path, "utf8"), "Hand-authored agent.");
+  assert.equal(readFileSync(manifestPath, "utf8"), before);
+  assert.equal(existsSync(join(projectRoot, ".generated-agents.json")), false);
 });
