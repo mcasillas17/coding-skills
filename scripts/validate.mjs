@@ -181,10 +181,12 @@ export function validateConfig(config) {
 }
 
 function runCli() {
-  const configPath = new URL(
-    "../skills/knights-of-the-round-table/config/reviewers.yaml",
-    import.meta.url,
-  );
+  const configPath =
+    process.argv[2] ??
+    new URL(
+      "../skills/knights-of-the-round-table/config/reviewers.yaml",
+      import.meta.url,
+    );
 
   let config;
   try {

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import YAML from "yaml";
 
@@ -43,18 +50,97 @@ function validConfig(overrides = {}) {
   };
 }
 
+function runValidatorWithConfig(contents) {
+  const directory = mkdtempSync(join(tmpdir(), "reviewer-config-"));
+  const temporaryConfigPath = join(directory, "reviewers.yaml");
+  writeFileSync(temporaryConfigPath, contents);
+
+  try {
+    return spawnSync(
+      process.execPath,
+      ["scripts/validate.mjs", temporaryConfigPath],
+      {
+        cwd: new URL("..", import.meta.url),
+        encoding: "utf8",
+      },
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 test("default configuration enables the approved acyclic reviewer roles", () => {
   const config = YAML.parse(readFileSync(configPath, "utf8"));
 
+  assert.equal(config.reviewerRetryCount, 1);
+  assert.deepEqual(config.taskSources, ["inline-prompt", "local-file"]);
   assert.deepEqual(
-    config.reviewers.map(({ role }) => role),
+    config.reviewers.map(({ role, prompt, harnesses: roleHarnesses }) => ({
+      role,
+      prompt,
+      harnesses: roleHarnesses,
+    })),
     [
-      "correctness",
-      "tests",
-      "security",
-      "documentation",
-      "architecture",
-      "performance",
+      {
+        role: "correctness",
+        prompt: "reviewers/correctness.md",
+        harnesses: {
+          claude: "correctness-reviewer",
+          copilot: "correctness-reviewer",
+          codex: "correctness-reviewer",
+          gemini: "correctness-reviewer",
+        },
+      },
+      {
+        role: "tests",
+        prompt: "reviewers/tests.md",
+        harnesses: {
+          claude: "tests-reviewer",
+          copilot: "tests-reviewer",
+          codex: "tests-reviewer",
+          gemini: "tests-reviewer",
+        },
+      },
+      {
+        role: "security",
+        prompt: "reviewers/security.md",
+        harnesses: {
+          claude: "security-reviewer",
+          copilot: "security-reviewer",
+          codex: "security-reviewer",
+          gemini: "security-reviewer",
+        },
+      },
+      {
+        role: "documentation",
+        prompt: "reviewers/documentation.md",
+        harnesses: {
+          claude: "documentation-reviewer",
+          copilot: "documentation-reviewer",
+          codex: "documentation-reviewer",
+          gemini: "documentation-reviewer",
+        },
+      },
+      {
+        role: "architecture",
+        prompt: "reviewers/architecture.md",
+        harnesses: {
+          claude: "architecture-reviewer",
+          copilot: "architecture-reviewer",
+          codex: "architecture-reviewer",
+          gemini: "architecture-reviewer",
+        },
+      },
+      {
+        role: "performance",
+        prompt: "reviewers/performance.md",
+        harnesses: {
+          claude: "performance-reviewer",
+          copilot: "performance-reviewer",
+          codex: "performance-reviewer",
+          gemini: "performance-reviewer",
+        },
+      },
     ],
   );
   assert.equal(config.maxReviewRounds, 10);
@@ -212,4 +298,21 @@ test("validator CLI reports the successful reviewer and harness counts", () => {
     "Validated 6 reviewer roles across 4 harnesses.",
   );
   assert.equal(result.stderr, "");
+});
+
+test("validator CLI exits 1 and reports validation failures to stderr", () => {
+  const result = runValidatorWithConfig("version: 2\nreviewers: []\n");
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /version must be 1/);
+  assert.match(result.stderr, /reviewers must be a non-empty array/);
+  assert.equal(result.stdout, "");
+});
+
+test("validator CLI exits 1 and reports YAML parse errors to stderr", () => {
+  const result = runValidatorWithConfig("reviewers: [\n");
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Unable to load reviewer configuration:/);
+  assert.equal(result.stdout, "");
 });
