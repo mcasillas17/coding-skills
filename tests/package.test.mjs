@@ -10,4 +10,8 @@ test("package declares the required scripts and skill metadata", () => {
   assert.equal(packageJson.scripts.test, "node --test tests/*.test.mjs");
   assert.equal(packageJson.scripts.validate, "node scripts/validate.mjs");
   assert.equal(packageJson.scripts.render, "node scripts/render-agents.mjs");
+  assert.equal(
+    packageJson.scripts.check,
+    "npm run validate && npm run render -- --check && npm test",
+  );
 });

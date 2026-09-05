@@ -18,12 +18,14 @@ const configPath = new URL(
   import.meta.url,
 );
 
-const harnesses = {
-  claude: "reviewer",
-  copilot: "reviewer",
-  codex: "reviewer",
-  gemini: "reviewer",
-};
+function harnessNames(name) {
+  return {
+    claude: name,
+    copilot: name,
+    codex: name,
+    gemini: name,
+  };
+}
 
 function validConfig(overrides = {}) {
   return {
@@ -37,13 +39,13 @@ function validConfig(overrides = {}) {
         role: "correctness",
         prompt: "reviewers/correctness.md",
         fallbackRole: null,
-        harnesses,
+        harnesses: harnessNames("correctness-reviewer"),
       },
       {
         role: "tests",
         prompt: "reviewers/tests.md",
         fallbackRole: "correctness",
-        harnesses,
+        harnesses: harnessNames("tests-reviewer"),
       },
     ],
     ...overrides,
@@ -188,13 +190,13 @@ test("configuration rejects duplicate roles and every fallback cycle", () => {
           role: "tests",
           prompt: "reviewers/tests.md",
           fallbackRole: null,
-          harnesses,
+          harnesses: harnessNames("tests-reviewer"),
         },
         {
           role: "tests",
           prompt: "reviewers/tests.md",
           fallbackRole: "tests",
-          harnesses,
+          harnesses: harnessNames("duplicate-tests-reviewer"),
         },
       ],
     }),
@@ -215,19 +217,19 @@ test("configuration rejects duplicate roles and every fallback cycle", () => {
           role: "correctness",
           prompt: "reviewers/correctness.md",
           fallbackRole: "architecture",
-          harnesses,
+          harnesses: harnessNames("correctness-reviewer"),
         },
         {
           role: "architecture",
           prompt: "reviewers/architecture.md",
           fallbackRole: "performance",
-          harnesses,
+          harnesses: harnessNames("architecture-reviewer"),
         },
         {
           role: "performance",
           prompt: "reviewers/performance.md",
           fallbackRole: "correctness",
-          harnesses,
+          harnesses: harnessNames("performance-reviewer"),
         },
       ],
     }),
@@ -236,6 +238,31 @@ test("configuration rejects duplicate roles and every fallback cycle", () => {
     multiRoleCycleErrors.some((error) =>
       error.includes("fallback cycle starting at correctness"),
     ),
+  );
+});
+
+test("configuration rejects duplicate agent names within each harness", () => {
+  const config = validConfig();
+  config.reviewers[1].harnesses = {
+    ...config.reviewers[1].harnesses,
+    claude: config.reviewers[0].harnesses.claude,
+  };
+
+  const errors = validateConfig(config);
+
+  assert.ok(
+    errors.some((error) =>
+      error.includes(
+        "duplicate harness agent name for claude: correctness-reviewer",
+      ),
+    ),
+    errors.join("\n"),
+  );
+  assert.ok(
+    !errors.some((error) =>
+      error.includes("duplicate harness agent name for copilot"),
+    ),
+    errors.join("\n"),
   );
 });
 

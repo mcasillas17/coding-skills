@@ -25,7 +25,7 @@ function isMapping(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function isSafeRelativePath(value) {
+export function isSafeRelativePath(value) {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
@@ -93,6 +93,9 @@ export function validateConfig(config) {
 
   const roleNames = new Set();
   const reviewerByRole = new Map();
+  const harnessAgentNames = Object.fromEntries(
+    HARNESSES.map((harness) => [harness, new Set()]),
+  );
 
   for (const [index, reviewer] of config.reviewers.entries()) {
     const label = `reviewers[${index}]`;
@@ -144,6 +147,12 @@ export function validateConfig(config) {
         reviewer.harnesses[harness].trim() === ""
       ) {
         errors.push(`${label} harness ${harness} must map to a non-empty agent`);
+      } else if (harnessAgentNames[harness].has(reviewer.harnesses[harness])) {
+        errors.push(
+          `duplicate harness agent name for ${harness}: ${reviewer.harnesses[harness]}`,
+        );
+      } else {
+        harnessAgentNames[harness].add(reviewer.harnesses[harness]);
       }
     }
     for (const harness of Object.keys(reviewer.harnesses)) {
@@ -178,6 +187,13 @@ export function validateConfig(config) {
   }
 
   return errors;
+}
+
+export function assertValidConfig(config) {
+  const errors = validateConfig(config);
+  if (errors.length > 0) {
+    throw new Error(`Invalid reviewer configuration:\n${errors.join("\n")}`);
+  }
 }
 
 function runCli() {

@@ -1,9 +1,22 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-import { renderAll } from "../scripts/render-agents.mjs";
+import * as renderer from "../scripts/render-agents.mjs";
+
+const { renderAll } = renderer;
 
 const repositoryRoot = new URL("..", import.meta.url);
 const harnessDirectories = {
@@ -12,6 +25,49 @@ const harnessDirectories = {
   codex: "generated/codex/agents",
   gemini: "generated/gemini/agents",
 };
+
+function harnessNames(name) {
+  return {
+    claude: name,
+    copilot: name,
+    codex: name,
+    gemini: name,
+  };
+}
+
+function validConfig(overrides = {}) {
+  return {
+    version: 1,
+    maxReviewRounds: 10,
+    reviewerRetryCount: 1,
+    documentationPolicy: "impact-based",
+    taskSources: ["inline-prompt", "local-file"],
+    reviewers: [
+      {
+        role: "correctness",
+        prompt: "reviewers/correctness.md",
+        fallbackRole: null,
+        harnesses: harnessNames("correctness-reviewer"),
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function createRendererProject() {
+  const projectRoot = mkdtempSync(join(tmpdir(), "reviewer-renderer-"));
+  const promptDirectory = join(
+    projectRoot,
+    "skills/knights-of-the-round-table/reviewers",
+  );
+  mkdirSync(promptDirectory, { recursive: true });
+  writeFileSync(join(promptDirectory, "correctness.md"), "Review only.");
+  return projectRoot;
+}
+
+function removeRendererProject(projectRoot) {
+  rmSync(projectRoot, { recursive: true, force: true });
+}
 
 function checkedInUrl(harness, relativePath) {
   return new URL(
@@ -115,11 +171,12 @@ test("harness adapters declare only read-only tools and safely escaped metadata"
   }
 
   const escaped = renderAll({
-    config: {
+    config: validConfig({
       reviewers: [
         {
           role: "correctness",
           prompt: "reviewers/correctness.md",
+          fallbackRole: null,
           harnesses: {
             claude: 'quoted: "reviewer"',
             copilot: 'quoted: "reviewer"',
@@ -128,7 +185,7 @@ test("harness adapters declare only read-only tools and safely escaped metadata"
           },
         },
       ],
-    },
+    }),
     prompts: {
       "reviewers/correctness.md": "Line one\nLine \"two\"\\three",
     },
@@ -162,6 +219,157 @@ test("checked-in generated agents match renderer output", () => {
 
 test("renderer output is deterministic", () => {
   assert.deepEqual(renderAll(), renderAll());
+});
+
+test("renderer rejects duplicate output filenames instead of overwriting", () => {
+  const config = validConfig({
+    reviewers: [
+      {
+        role: "correctness",
+        prompt: "reviewers/correctness.md",
+        fallbackRole: null,
+        harnesses: harnessNames("shared-reviewer"),
+      },
+      {
+        role: "tests",
+        prompt: "reviewers/tests.md",
+        fallbackRole: "correctness",
+        harnesses: harnessNames("shared-reviewer"),
+      },
+    ],
+  });
+
+  assert.throws(
+    () =>
+      renderer.renderAgents(config, {
+        "reviewers/correctness.md": "Correctness prompt.",
+        "reviewers/tests.md": "Tests prompt.",
+      }),
+    /duplicate output filename for claude: shared-reviewer\.md/,
+  );
+});
+
+test("invalid empty reviewer config performs no writes or deletions", () => {
+  const projectRoot = createRendererProject();
+  const agentsDirectory = join(projectRoot, "agents");
+  const manualPath = join(agentsDirectory, "manual.agent.md");
+  const stalePath = join(agentsDirectory, "stale.agent.md");
+  const manifestPath = join(projectRoot, ".generated-agents.json");
+  const manifest = `${JSON.stringify(
+    { version: 1, files: ["agents/stale.agent.md"] },
+    null,
+    2,
+  )}\n`;
+  mkdirSync(agentsDirectory, { recursive: true });
+  writeFileSync(manualPath, "Hand-authored.");
+  writeFileSync(stalePath, "Previously generated.");
+  writeFileSync(manifestPath, manifest);
+
+  try {
+    assert.throws(
+      () =>
+        renderer.synchronizeGeneratedAgents({
+          projectRoot,
+          config: { reviewers: [] },
+        }),
+      /reviewers must be a non-empty array/,
+    );
+    assert.equal(readFileSync(manualPath, "utf8"), "Hand-authored.");
+    assert.equal(readFileSync(stalePath, "utf8"), "Previously generated.");
+    assert.equal(readFileSync(manifestPath, "utf8"), manifest);
+    assert.deepEqual(readdirSync(agentsDirectory).sort(), [
+      "manual.agent.md",
+      "stale.agent.md",
+    ]);
+  } finally {
+    removeRendererProject(projectRoot);
+  }
+});
+
+test("renderer rejects traversal prompts before attempting to read them", () => {
+  const projectRoot = createRendererProject();
+  const config = validConfig();
+  config.reviewers[0].prompt = "../outside.md";
+
+  try {
+    assert.throws(
+      () => renderAll({ projectRoot, config }),
+      /reviewers\[0\] prompt must be a safe relative path/,
+    );
+  } finally {
+    removeRendererProject(projectRoot);
+  }
+});
+
+test("renderer preserves unowned agent files and records generated ownership", () => {
+  const projectRoot = createRendererProject();
+  const manualPath = join(projectRoot, "agents/manual.agent.md");
+  mkdirSync(join(projectRoot, "agents"), { recursive: true });
+  writeFileSync(manualPath, "Hand-authored.");
+
+  try {
+    const result = renderer.synchronizeGeneratedAgents({
+      projectRoot,
+      config: validConfig(),
+    });
+
+    assert.equal(result.fileCount, 4);
+    assert.equal(readFileSync(manualPath, "utf8"), "Hand-authored.");
+    const manifest = JSON.parse(
+      readFileSync(join(projectRoot, ".generated-agents.json"), "utf8"),
+    );
+    assert.deepEqual(manifest, {
+      version: 1,
+      files: [
+        "agents/correctness-reviewer.agent.md",
+        "generated/claude/agents/correctness-reviewer.md",
+        "generated/codex/agents/correctness-reviewer.toml",
+        "generated/gemini/agents/correctness-reviewer.md",
+      ],
+    });
+  } finally {
+    removeRendererProject(projectRoot);
+  }
+});
+
+test("check mode reports missing and stale owned outputs without modifying files", () => {
+  const projectRoot = createRendererProject();
+
+  try {
+    renderer.synchronizeGeneratedAgents({
+      projectRoot,
+      config: validConfig(),
+    });
+    const missingPath = join(
+      projectRoot,
+      "agents/correctness-reviewer.agent.md",
+    );
+    const stalePath = join(projectRoot, "agents/stale.agent.md");
+    const manifestPath = join(projectRoot, ".generated-agents.json");
+    unlinkSync(missingPath);
+    writeFileSync(stalePath, "Stale generated output.");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.files.push("agents/stale.agent.md");
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const beforeManifest = readFileSync(manifestPath, "utf8");
+
+    const result = renderer.synchronizeGeneratedAgents({
+      projectRoot,
+      config: validConfig(),
+      check: true,
+    });
+
+    assert.deepEqual(result.drift, [
+      ".generated-agents.json",
+      "agents/correctness-reviewer.agent.md",
+      "agents/stale.agent.md",
+    ]);
+    assert.equal(existsSync(missingPath), false);
+    assert.equal(readFileSync(stalePath, "utf8"), "Stale generated output.");
+    assert.equal(readFileSync(manifestPath, "utf8"), beforeManifest);
+  } finally {
+    removeRendererProject(projectRoot);
+  }
 });
 
 test("check mode succeeds when current and fails when a generated file drifts", () => {

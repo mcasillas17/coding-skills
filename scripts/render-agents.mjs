@@ -1,19 +1,21 @@
 import {
   mkdirSync,
   readFileSync,
-  readdirSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
-const PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CONFIG_PATH = join(
-  PROJECT_ROOT,
-  "skills/knights-of-the-round-table/config/reviewers.yaml",
-);
+import { assertValidConfig, isSafeRelativePath } from "./validate.mjs";
+
+const DEFAULT_PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const CONFIG_RELATIVE_PATH =
+  "skills/knights-of-the-round-table/config/reviewers.yaml";
+const PROMPT_DIRECTORY = "skills/knights-of-the-round-table";
+const MANIFEST_FILENAME = ".generated-agents.json";
 const HARNESS_DIRECTORIES = {
   claude: "generated/claude/agents",
   copilot: "agents",
@@ -65,18 +67,44 @@ const renderers = {
     `model: inherit\n---\n\n${prompt}\n`,
 };
 
-function loadConfig() {
-  return YAML.parse(readFileSync(CONFIG_PATH, "utf8"));
+function toPosixPath(path) {
+  return path.split(sep).join("/");
 }
 
-function loadPrompts(config) {
+function loadConfig(projectRoot) {
+  return YAML.parse(
+    readFileSync(resolve(projectRoot, CONFIG_RELATIVE_PATH), "utf8"),
+  );
+}
+
+function resolveContainedPromptPath(projectRoot, prompt) {
+  if (!isSafeRelativePath(prompt)) {
+    throw new Error(`Unsafe reviewer prompt path: ${prompt}`);
+  }
+
+  const promptRoot = resolve(projectRoot, PROMPT_DIRECTORY);
+  const promptPath = resolve(promptRoot, prompt);
+  const relativePromptPath = toPosixPath(relative(promptRoot, promptPath));
+  if (!isSafeRelativePath(relativePromptPath)) {
+    throw new Error(`Unsafe reviewer prompt path: ${prompt}`);
+  }
+
+  const realPromptRoot = realpathSync(promptRoot);
+  const realPromptPath = realpathSync(promptPath);
+  const realRelativePromptPath = toPosixPath(
+    relative(realPromptRoot, realPromptPath),
+  );
+  if (!isSafeRelativePath(realRelativePromptPath)) {
+    throw new Error(`Reviewer prompt escapes prompt directory: ${prompt}`);
+  }
+  return realPromptPath;
+}
+
+function loadPrompts(config, projectRoot) {
   return Object.fromEntries(
     config.reviewers.map(({ prompt }) => [
       prompt,
-      readFileSync(
-        join(PROJECT_ROOT, "skills/knights-of-the-round-table", prompt),
-        "utf8",
-      ),
+      readFileSync(resolveContainedPromptPath(projectRoot, prompt), "utf8"),
     ]),
   );
 }
@@ -85,9 +113,7 @@ function outputFilename(harness, name) {
   return `${name}${HARNESS_EXTENSIONS[harness]}`;
 }
 
-export function renderAll(options = {}) {
-  const config = options.config ?? loadConfig();
-  const prompts = options.prompts ?? loadPrompts(config);
+export function renderAgents(config, prompts) {
   const rendered = Object.fromEntries(
     Object.keys(HARNESS_DIRECTORIES).map((harness) => [harness, {}]),
   );
@@ -101,6 +127,11 @@ export function renderAll(options = {}) {
     for (const harness of Object.keys(HARNESS_DIRECTORIES)) {
       const name = reviewer.harnesses[harness];
       const filename = outputFilename(harness, name);
+      if (Object.hasOwn(rendered[harness], filename)) {
+        throw new Error(
+          `duplicate output filename for ${harness}: ${filename}`,
+        );
+      }
       rendered[harness][filename] = renderers[harness]({
         name,
         description,
@@ -112,8 +143,19 @@ export function renderAll(options = {}) {
   return rendered;
 }
 
-function generatedPath(harness, relativePath) {
-  const directory = resolve(PROJECT_ROOT, HARNESS_DIRECTORIES[harness]);
+export function renderAll(options = {}) {
+  const projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
+  const config = options.config ?? loadConfig(projectRoot);
+  assertValidConfig(config);
+  const prompts = options.prompts ?? loadPrompts(config, projectRoot);
+  return renderAgents(config, prompts);
+}
+
+function generatedPath(projectRoot, harness, relativePath) {
+  const directory = resolve(projectRoot, HARNESS_DIRECTORIES[harness]);
+  if (!isSafeRelativePath(relativePath) || relativePath.includes("/")) {
+    throw new Error(`Unsafe generated agent path: ${relativePath}`);
+  }
   const path = resolve(directory, relativePath);
   if (dirname(path) !== directory) {
     throw new Error(`Unsafe generated agent path: ${relativePath}`);
@@ -121,80 +163,202 @@ function generatedPath(harness, relativePath) {
   return path;
 }
 
-function findDrift(rendered) {
+function expectedOwnedPaths(rendered) {
+  return Object.entries(rendered)
+    .flatMap(([harness, files]) =>
+      Object.keys(files).map(
+        (relativePath) =>
+          `${HARNESS_DIRECTORIES[harness]}/${relativePath}`,
+      ),
+    )
+    .sort();
+}
+
+function ownedOutputPath(projectRoot, ownedPath) {
+  if (!isSafeRelativePath(ownedPath)) {
+    throw new Error(`Unsafe generated ownership path: ${ownedPath}`);
+  }
+
+  for (const [harness, directory] of Object.entries(HARNESS_DIRECTORIES)) {
+    const prefix = `${directory}/`;
+    if (!ownedPath.startsWith(prefix)) {
+      continue;
+    }
+    const relativePath = ownedPath.slice(prefix.length);
+    if (
+      relativePath.includes("/") ||
+      !relativePath.endsWith(HARNESS_EXTENSIONS[harness])
+    ) {
+      break;
+    }
+    return generatedPath(projectRoot, harness, relativePath);
+  }
+
+  throw new Error(`Unsafe generated ownership path: ${ownedPath}`);
+}
+
+function ownershipManifestPath(projectRoot) {
+  return resolve(projectRoot, MANIFEST_FILENAME);
+}
+
+function serializeManifest(files) {
+  return `${JSON.stringify({ version: 1, files }, null, 2)}\n`;
+}
+
+function loadOwnershipManifest(projectRoot) {
+  let contents;
+  try {
+    contents = readFileSync(ownershipManifestPath(projectRoot), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { exists: false, files: [], contents: null };
+    }
+    throw error;
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(contents);
+  } catch (error) {
+    throw new Error(`Unable to parse ${MANIFEST_FILENAME}: ${error.message}`);
+  }
+
+  if (
+    manifest === null ||
+    typeof manifest !== "object" ||
+    Array.isArray(manifest) ||
+    manifest.version !== 1 ||
+    !Array.isArray(manifest.files)
+  ) {
+    throw new Error(`${MANIFEST_FILENAME} must contain version 1 and files`);
+  }
+
+  const files = [];
+  const seenFiles = new Set();
+  for (const ownedPath of manifest.files) {
+    if (typeof ownedPath !== "string") {
+      throw new Error(`${MANIFEST_FILENAME} files must be strings`);
+    }
+    ownedOutputPath(projectRoot, ownedPath);
+    if (seenFiles.has(ownedPath)) {
+      throw new Error(`${MANIFEST_FILENAME} contains duplicate paths`);
+    }
+    seenFiles.add(ownedPath);
+    files.push(ownedPath);
+  }
+
+  return { exists: true, files, contents };
+}
+
+function findDrift(projectRoot, rendered, manifest) {
   const drift = [];
+  const expectedFiles = expectedOwnedPaths(rendered);
+  const expectedFileSet = new Set(expectedFiles);
 
   for (const [harness, files] of Object.entries(rendered)) {
-    const directory = resolve(PROJECT_ROOT, HARNESS_DIRECTORIES[harness]);
-    const expectedFiles = new Set(Object.keys(files));
-
     for (const [relativePath, expected] of Object.entries(files)) {
-      const path = generatedPath(harness, relativePath);
+      const path = generatedPath(projectRoot, harness, relativePath);
       let actual;
       try {
         actual = readFileSync(path, "utf8");
       } catch {
-        drift.push(relative(PROJECT_ROOT, path));
+        drift.push(`${HARNESS_DIRECTORIES[harness]}/${relativePath}`);
         continue;
       }
       if (actual !== expected) {
-        drift.push(relative(PROJECT_ROOT, path));
+        drift.push(`${HARNESS_DIRECTORIES[harness]}/${relativePath}`);
       }
     }
+  }
 
-    let existingFiles = [];
-    try {
-      existingFiles = readdirSync(directory);
-    } catch {
-      continue;
-    }
-    for (const existingFile of existingFiles) {
-      if (
-        existingFile.endsWith(HARNESS_EXTENSIONS[harness]) &&
-        !expectedFiles.has(existingFile)
-      ) {
-        drift.push(relative(PROJECT_ROOT, join(directory, existingFile)));
-      }
+  if (
+    !manifest.exists ||
+    manifest.contents !== serializeManifest(expectedFiles)
+  ) {
+    drift.push(MANIFEST_FILENAME);
+  }
+
+  for (const ownedPath of manifest.files) {
+    if (!expectedFileSet.has(ownedPath)) {
+      drift.push(ownedPath);
     }
   }
 
   return [...new Set(drift)].sort();
 }
 
-function writeRendered(rendered) {
+function synchronizeOwnedOutputs(projectRoot, rendered, manifest) {
+  const expectedFiles = expectedOwnedPaths(rendered);
+  const expectedFileSet = new Set(expectedFiles);
+
   for (const [harness, files] of Object.entries(rendered)) {
-    const directory = resolve(PROJECT_ROOT, HARNESS_DIRECTORIES[harness]);
+    const directory = resolve(projectRoot, HARNESS_DIRECTORIES[harness]);
     mkdirSync(directory, { recursive: true });
-
-    for (const existingFile of readdirSync(directory)) {
-      if (
-        existingFile.endsWith(HARNESS_EXTENSIONS[harness]) &&
-        !Object.hasOwn(files, existingFile)
-      ) {
-        rmSync(generatedPath(harness, existingFile));
-      }
-    }
-
     for (const [relativePath, content] of Object.entries(files)) {
-      writeFileSync(generatedPath(harness, relativePath), content);
+      writeFileSync(
+        generatedPath(projectRoot, harness, relativePath),
+        content,
+      );
     }
   }
+
+  for (const ownedPath of manifest.files) {
+    if (!expectedFileSet.has(ownedPath)) {
+      rmSync(ownedOutputPath(projectRoot, ownedPath), { force: true });
+    }
+  }
+
+  writeFileSync(
+    ownershipManifestPath(projectRoot),
+    serializeManifest(expectedFiles),
+  );
+}
+
+export function synchronizeGeneratedAgents(options = {}) {
+  const projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
+  const rendered = renderAll({
+    projectRoot,
+    config: options.config,
+    prompts: options.prompts,
+  });
+  const manifest = loadOwnershipManifest(projectRoot);
+  const drift = findDrift(projectRoot, rendered, manifest);
+  const fileCount = Object.values(rendered).reduce(
+    (count, files) => count + Object.keys(files).length,
+    0,
+  );
+
+  if (!options.check) {
+    synchronizeOwnedOutputs(projectRoot, rendered, manifest);
+  }
+
+  return { drift, fileCount };
 }
 
 function runCli() {
-  const unknownArguments = process.argv.slice(2).filter((arg) => arg !== "--check");
+  const unknownArguments = process.argv
+    .slice(2)
+    .filter((arg) => arg !== "--check");
   if (unknownArguments.length > 0) {
     console.error(`Unknown argument: ${unknownArguments[0]}`);
     process.exitCode = 1;
     return;
   }
 
-  const rendered = renderAll();
-  if (process.argv.includes("--check")) {
-    const drift = findDrift(rendered);
-    if (drift.length > 0) {
+  const check = process.argv.includes("--check");
+  let result;
+  try {
+    result = synchronizeGeneratedAgents({ check });
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (check) {
+    if (result.drift.length > 0) {
       console.error("Generated reviewer agents are out of date:");
-      for (const path of drift) {
+      for (const path of result.drift) {
         console.error(`- ${path}`);
       }
       process.exitCode = 1;
@@ -204,12 +368,7 @@ function runCli() {
     return;
   }
 
-  writeRendered(rendered);
-  const fileCount = Object.values(rendered).reduce(
-    (count, files) => count + Object.keys(files).length,
-    0,
-  );
-  console.log(`Rendered ${fileCount} reviewer agents.`);
+  console.log(`Rendered ${result.fileCount} reviewer agents.`);
 }
 
 const isMain =
