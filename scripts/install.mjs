@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  fchmodSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -112,11 +114,19 @@ function uniqueSiblingPath(targetPath, label) {
   );
 }
 
-function writeDurableNewFile(filePath, content) {
+function writeDurableNewFile(filePath, content, executeBits) {
   let fileDescriptor;
   try {
     fileDescriptor = openSync(filePath, "wx");
     writeFileSync(fileDescriptor, content);
+    if (executeBits !== undefined) {
+      // Keep umask-controlled read/write permissions, preserve only source
+      // execute bits, and never propagate setuid, setgid, or sticky bits.
+      fchmodSync(
+        fileDescriptor,
+        (fstatSync(fileDescriptor).mode & 0o666) | executeBits,
+      );
+    }
     fsyncSync(fileDescriptor);
   } finally {
     if (fileDescriptor !== undefined) {
@@ -356,7 +366,11 @@ function serializeManifest(manifest) {
 
 function normalizedManifestFiles(files) {
   return [...files]
-    .map(({ path, sha256: hash }) => ({ path, sha256: hash }))
+    .map(({ path, sha256: hash, executeBits }) => ({
+      path,
+      sha256: hash,
+      ...(executeBits === undefined ? {} : { executeBits }),
+    }))
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -396,7 +410,10 @@ function isValidManifestFileList(files) {
         typeof file === "object" &&
         typeof file.path === "string" &&
         typeof file.sha256 === "string" &&
-        /^[0-9a-f]{64}$/.test(file.sha256),
+        /^[0-9a-f]{64}$/.test(file.sha256) &&
+        (file.executeBits === undefined ||
+          (Number.isInteger(file.executeBits) &&
+            (file.executeBits & 0o111) === file.executeBits)),
     )
   );
 }
@@ -688,7 +705,11 @@ function assertManifestFilesUncorrupted(directory, files) {
       );
     }
     const actualHash = sha256(readFileSync(filePath));
-    if (actualHash !== file.sha256) {
+    if (
+      actualHash !== file.sha256 ||
+      (file.executeBits !== undefined &&
+        (stat.mode & 0o111) !== file.executeBits)
+    ) {
       throw new Error(
         `Refusing to install: file has drifted from the installer manifest, refusing to modify it: ${filePath}`,
       );
@@ -847,8 +868,8 @@ function parseFrontmatter(text, sourceLabel) {
 
 // Recursively reads the source skill directory, rejecting symlinks and any
 // non-regular entries, and returns the sorted file list with content and
-// hashes (item 11). The top-level manifest filename is reserved for
-// installer-owned metadata (written by installSkillGroup) and must not
+// hashes and execute bits (item 11). The top-level manifest filename is
+// reserved for installer-owned metadata (written by installSkillGroup) and must not
 // exist as payload in the source tree, or a first install would silently
 // overwrite it and a later force update would be permanently unable to
 // reconcile it against `walkExistingDestinationFiles`, which excludes that
@@ -902,6 +923,7 @@ function readSourceSkillTree(skillDir, realSkillDir) {
         relativePath: toPosixPath(relativePath),
         content,
         sha256: sha256(content),
+        executeBits: lstatSync(entryPath).mode & 0o111,
       });
     }
   }
@@ -969,29 +991,36 @@ function validateSource({ projectRoot, skill, harnesses }) {
   }
 
   const isKnightsSkill = skill === DEFAULT_SKILL;
+  const renderedAgents = isKnightsSkill
+    ? renderAll({ projectRoot: realProjectRoot })
+    : null;
   const generatedAgents = isKnightsSkill
-    ? validateGeneratedAgents({ projectRoot: realProjectRoot, harnesses })
+    ? validateGeneratedAgents({
+        projectRoot: realProjectRoot,
+        harnesses,
+        rendered: renderedAgents,
+      })
     : {};
 
   return {
     resolvedProjectRoot,
+    realProjectRoot,
     skillDir,
     skillVersion,
     files,
     isKnightsSkill,
     generatedAgents,
+    renderedAgents,
   };
 }
 
-// Renders the canonical reviewer agents from source (validating the
-// reviewer config and prompts as a side effect) and confirms that every
-// checked-in generated agent for each selected harness is a regular,
-// non-symlink file whose contents match that render output (item 11).
+// Confirms that every checked-in generated agent for each selected harness
+// is a regular, non-symlink file whose contents match the previously
+// validated render snapshot (item 11).
 // `projectRoot` here must already be a fully resolved realpath (see
 // validateSource), since assertSafeSourceDirectory below measures
 // containment against it directly.
-function validateGeneratedAgents({ projectRoot, harnesses }) {
-  const rendered = renderAll({ projectRoot });
+function validateGeneratedAgents({ projectRoot, harnesses, rendered }) {
   const result = {};
 
   for (const harness of harnesses) {
@@ -1705,20 +1734,22 @@ function validatePartiallyRemovedSkillDirectory({
     );
   }
 
-  const expectedHashes = new Map(
-    manifestResult.manifest.files.map((file) => [file.path, file.sha256]),
+  const expectedFilesByPath = new Map(
+    manifestResult.manifest.files.map((file) => [file.path, file]),
   );
   for (const relativePath of walkExistingDestinationFiles(
     directory,
     manifestResult.manifest.files,
   )) {
-    const expectedHash = expectedHashes.get(relativePath);
+    const expectedFile = expectedFilesByPath.get(relativePath);
     const filePath = resolve(directory, relativePath);
     if (
-      expectedHash === undefined ||
+      expectedFile === undefined ||
       !isSafeRelativePath(relativePath) ||
       !isContainedPath(directory, filePath) ||
-      sha256(readFileSync(filePath)) !== expectedHash
+      sha256(readFileSync(filePath)) !== expectedFile.sha256 ||
+      (expectedFile.executeBits !== undefined &&
+        (lstatSync(filePath).mode & 0o111) !== expectedFile.executeBits)
     ) {
       throw new Error(
         `Refusing to install: ${description} contains changed or untracked files: ${directory}`,
@@ -1769,7 +1800,9 @@ function removeOwnedSkillDirectoryIncrementally({
     if (
       stat.isSymbolicLink() ||
       !stat.isFile() ||
-      sha256(readFileSync(filePath)) !== file.sha256
+      sha256(readFileSync(filePath)) !== file.sha256 ||
+      (file.executeBits !== undefined &&
+        (stat.mode & 0o111) !== file.executeBits)
     ) {
       throw new Error(
         `Refusing to install: ${description} file changed during cleanup: ${filePath}`,
@@ -2543,6 +2576,7 @@ function installSkillGroup({
   const manifestFiles = sourceFiles.map((file) => ({
     path: file.relativePath,
     sha256: sha256(file.content),
+    executeBits: file.executeBits,
   }));
   const manifest = buildManifest({
     skill,
@@ -2642,7 +2676,7 @@ function installSkillGroup({
       const fileDirectory = dirname(filePath);
       mkdirSync(fileDirectory, { recursive: true });
       addDirectoryChain(stagedDirectories, stageDir, fileDirectory);
-      writeDurableNewFile(filePath, file.content);
+      writeDurableNewFile(filePath, file.content, file.executeBits);
     }
 
     onInstallEvent({ phase: "before-skill-manifest", targetDir });
@@ -3155,7 +3189,7 @@ export function install(options = {}) {
   const skill = options.skill ?? DEFAULT_SKILL;
   assertSafeSkillName(skill);
 
-  const harnesses = normalizeHarnesses(options.harnesses ?? ["all"]);
+  let harnesses = normalizeHarnesses(options.harnesses ?? ["all"]);
   const force = options.force === true;
   const onInstallEvent = options.onInstallEvent ?? (() => {});
   if (typeof onInstallEvent !== "function") {
@@ -3183,14 +3217,6 @@ export function install(options = {}) {
     ),
     targetDir: resolve(resolvedHome, group.relativeDir(skill)),
   }));
-
-  const agentGroups = source.isKnightsSkill
-    ? harnesses.map((harness) => ({
-        harness,
-        targetDir: resolve(resolvedHome, AGENT_HARNESS_DIRS[harness]),
-        files: source.generatedAgents[harness],
-      }))
-    : [];
 
   // Restore or finalize any previously journaled whole-skill swap before
   // ordinary ownership preflight. Recovery only touches artifacts named and
@@ -3227,6 +3253,35 @@ export function install(options = {}) {
       finalHarnesses,
     };
   });
+
+  // Replacing a shared skill snapshot also replaces the config/prompts used
+  // by its previously installed siblings. Update their agents in this plan,
+  // not just their ownership entries. Never add an uninstalled sibling.
+  const sharedSiblings = skillPreflight.flatMap(({ priorHarnesses }) =>
+    priorHarnesses.filter((harness) => !harnesses.includes(harness)),
+  );
+  if (sharedSiblings.length > 0) {
+    if (source.isKnightsSkill) {
+      Object.assign(
+        source.generatedAgents,
+        validateGeneratedAgents({
+          projectRoot: source.realProjectRoot,
+          harnesses: sharedSiblings,
+          // Use the original render snapshot even if source files changed
+          // after validation; the shared skill and agents must agree.
+          rendered: source.renderedAgents,
+        }),
+      );
+    }
+    harnesses = normalizeHarnesses([...harnesses, ...sharedSiblings]);
+  }
+  const agentGroups = source.isKnightsSkill
+    ? harnesses.map((harness) => ({
+        harness,
+        targetDir: resolve(resolvedHome, AGENT_HARNESS_DIRS[harness]),
+        files: source.generatedAgents[harness],
+      }))
+    : [];
 
   // Complete every interrupted agent transaction that depends on one of the
   // skill snapshots above before replacing that snapshot. This includes an

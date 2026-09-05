@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -386,6 +387,282 @@ test("force reinstall of one shared harness preserves the sibling harness's mani
   const manifest = readManifest(sharedDir);
   assert.deepEqual([...manifest.harnesses].sort(), ["codex", "gemini"]);
   assert.equal(existsSync(join(sharedDir, "SKILL.md")), true);
+});
+
+for (const [selected, sibling] of [["codex", "gemini"], ["gemini", "codex"]]) {
+  test(`updating ${selected} also updates its installed shared ${sibling} agents`, (t) => {
+    const projectRoot = withFixture(t);
+    const home = withHome(t);
+    install({ projectRoot, home, harnesses: ["claude", "codex", "gemini"] });
+    const untouchedSkillDir = join(home, ".claude/skills/knights-of-the-round-table");
+    const untouchedManifest = readFileSync(join(untouchedSkillDir, ".knights-install.json"));
+    const untouchedAgentsManifest = readFileSync(join(home, ".claude/agents/.knights-install.json"));
+    const siblingDir = join(home, AGENT_HARNESS_DIRS[sibling]);
+    writeFileSync(join(siblingDir, "unrelated.txt"), "leave this alone\n");
+    writeFileSync(
+      join(projectRoot, "skills/knights-of-the-round-table/config/reviewers.yaml"),
+      skillYamlWithHarnessName("security", sibling, "security-reviewer-v2"),
+    );
+    resyncGeneratedAgentSourceDir(projectRoot, sibling);
+    const expectedAgents = renderAll({ projectRoot })[sibling];
+    const expectedConfig = readFileSync(
+      join(projectRoot, "skills/knights-of-the-round-table/config/reviewers.yaml"),
+    );
+
+    const result = install({
+      projectRoot, home, harnesses: [selected], force: true,
+      onInstallEvent({ phase }) {
+        if (phase === "source-validated") {
+          writeFileSync(
+            join(projectRoot, "skills/knights-of-the-round-table/config/reviewers.yaml"),
+            skillYamlWithHarnessName("security", sibling, "security-reviewer-v3"),
+          );
+        }
+      },
+    });
+
+    for (const [filename, content] of Object.entries(expectedAgents)) {
+      assert.equal(readFileSync(join(siblingDir, filename), "utf8"), content);
+    }
+    assert.deepEqual(result.harnesses, ["codex", "gemini"]);
+    assert.deepEqual(
+      readFileSync(join(home, ".agents/skills/knights-of-the-round-table/config/reviewers.yaml")),
+      expectedConfig,
+    );
+    const staleFilename = sibling === "codex" ? "security-reviewer.toml" : "security-reviewer.md";
+    assert.equal(existsSync(join(siblingDir, staleFilename)), false);
+    assert.deepEqual(
+      readManifest(siblingDir).files.map((file) => file.path).sort(),
+      Object.keys(expectedAgents).sort(),
+    );
+    assert.equal(readFileSync(join(siblingDir, "unrelated.txt"), "utf8"), "leave this alone\n");
+    assert.deepEqual(readFileSync(join(untouchedSkillDir, ".knights-install.json")), untouchedManifest);
+    assert.deepEqual(readFileSync(join(home, ".claude/agents/.knights-install.json")), untouchedAgentsManifest);
+    for (const directory of [untouchedSkillDir, join(home, ".claude/agents")]) {
+      for (const file of readManifest(directory).files) {
+        assert.equal(sha256(readFileSync(join(directory, file.path))), file.sha256);
+      }
+    }
+    assert.equal(existsSync(join(home, ".copilot")), false);
+  });
+}
+
+for (const problem of ["invalid source", "unmanaged collision", "owned drift"]) {
+  test(`shared sibling ${problem} blocks all selected destinations before mutation`, (t) => {
+    const projectRoot = withFixture(t);
+    const home = withHome(t);
+    install({ projectRoot, home, harnesses: ["codex", "gemini"] });
+    const sharedDir = join(home, ".agents/skills/knights-of-the-round-table");
+    const priorConfig = readFileSync(join(sharedDir, "config/reviewers.yaml"));
+    const priorManifest = readFileSync(join(sharedDir, ".knights-install.json"));
+    const codexManifest = readFileSync(join(home, ".codex/agents/.knights-install.json"));
+    const geminiDir = join(home, ".gemini/agents");
+    writeFileSync(
+      join(projectRoot, "skills/knights-of-the-round-table/config/reviewers.yaml"),
+      skillYamlWithHarnessName("security", "gemini", "security-reviewer-v2"),
+    );
+    resyncGeneratedAgentSourceDir(projectRoot, "gemini");
+    const changedPath = problem === "invalid source"
+      ? join(projectRoot, "generated/gemini/agents/security-reviewer-v2.md")
+      : join(geminiDir, problem === "unmanaged collision" ? "security-reviewer-v2.md" : "security-reviewer.md");
+    writeFileSync(changedPath, "not installer-owned content\n");
+
+    assert.throws(
+      () => install({ projectRoot, home, harnesses: ["claude", "codex"], force: true }),
+      /out of date|unmanaged|drift/i,
+    );
+    assert.equal(existsSync(join(home, ".claude")), false);
+    assert.deepEqual(readFileSync(join(sharedDir, "config/reviewers.yaml")), priorConfig);
+    assert.deepEqual(readFileSync(join(sharedDir, ".knights-install.json")), priorManifest);
+    assert.deepEqual(readFileSync(join(home, ".codex/agents/.knights-install.json")), codexManifest);
+    assert.equal(readFileSync(changedPath, "utf8"), "not installer-owned content\n");
+    assert.deepEqual(listEntries(dirname(sharedDir)), ["knights-of-the-round-table"]);
+  });
+}
+
+test("updating a sole shared harness does not install an absent sibling", (t) => {
+  const projectRoot = withFixture(t);
+  const home = withHome(t);
+  install({ projectRoot, home, harnesses: ["codex"] });
+  const result = install({ projectRoot, home, harnesses: ["codex"], force: true });
+  assert.deepEqual(result.harnesses, ["codex"]);
+  assert.equal(existsSync(join(home, ".gemini")), false);
+});
+
+test("generic skill scripts retain safe execute bits on install and force updates", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceDir = createGenericSkillFixture(projectRoot, "other-skill");
+  mkdirSync(join(sourceDir, "scripts"));
+  const sourceScript = join(sourceDir, "scripts/run.sh");
+  const home = withHome(t);
+  const installedDir = join(home, ".claude/skills/other-skill");
+  const installedScript = join(installedDir, "scripts/run.sh");
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+
+  for (const [index, mode] of [0o755, 0o6751, 0o644, 0o700].entries()) {
+    const content = `#!/bin/sh\nprintf 'version ${index}\\n'\n`;
+    writeFileSync(sourceScript, content);
+    chmodSync(sourceScript, mode);
+    install({
+      ...options,
+      force: index > 0,
+      onInstallEvent({ phase }) {
+        if (phase === "source-validated") {
+          // Both bytes and permissions must come from the validated snapshot.
+          chmodSync(sourceScript, 0o600);
+        }
+      },
+    });
+    const installedMode = lstatSync(installedScript).mode;
+    assert.equal(installedMode & 0o111, mode & 0o111);
+    assert.equal(installedMode & 0o7000, 0, "never copy special permission bits");
+    assert.equal(installedMode & 0o666, 0o666 & ~process.umask());
+    assert.equal(readFileSync(installedScript, "utf8"), content);
+    if (mode & 0o100) {
+      const execution = spawnSync(installedScript, [], { encoding: "utf8" });
+      assert.equal(execution.status, 0, execution.stderr);
+      assert.equal(execution.stdout, `version ${index}\n`);
+    }
+    assert.equal(
+      readManifest(installedDir).files.find((file) => file.path === "scripts/run.sh").executeBits,
+      mode & 0o111,
+    );
+  }
+});
+
+test("execute-bit drift in an installed skill blocks force updates", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+  install(options);
+  const installedDir = join(home, ".claude/skills/other-skill");
+  const manifest = readFileSync(join(installedDir, ".knights-install.json"));
+  const notes = join(installedDir, "NOTES.md");
+  chmodSync(notes, 0o755);
+  assert.throws(() => install({ ...options, force: true }), /drift/i);
+  assert.equal(lstatSync(notes).mode & 0o111, 0o111);
+  assert.deepEqual(readFileSync(join(installedDir, ".knights-install.json")), manifest);
+  assert.deepEqual(listEntries(dirname(installedDir)), ["other-skill"]);
+});
+
+test("execute-bit drift in a staged skill is rejected before publication", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceDir = createGenericSkillFixture(projectRoot, "other-skill");
+  chmodSync(join(sourceDir, "NOTES.md"), 0o755);
+  const home = withHome(t);
+  const parentDir = join(home, ".claude/skills");
+  assert.throws(
+    () => install({
+      projectRoot, home, skill: "other-skill", harnesses: ["claude"],
+      onInstallEvent({ phase }) {
+        if (phase === "before-skill-manifest") {
+          const [stage] = skillStageNames(parentDir, "other-skill");
+          chmodSync(join(parentDir, stage, "NOTES.md"), 0o644);
+        }
+      },
+    }),
+    /drift/i,
+  );
+  assert.deepEqual(listEntries(parentDir), []);
+});
+
+test("executable skill rollback and hard-exit recovery retain the prior permissions", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const sourceNotes = join(sourceDir, "NOTES.md");
+  chmodSync(sourceNotes, 0o755);
+  const home = withHome(t);
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+  const installedDir = join(home, ".claude/skills/other-skill");
+  const installedNotes = join(installedDir, "NOTES.md");
+  install(options);
+  const priorContent = readFileSync(installedNotes);
+  const priorManifest = readFileSync(join(installedDir, ".knights-install.json"));
+  writeFileSync(sourceNotes, "next version\n");
+  chmodSync(sourceNotes, 0o700);
+  assert.throws(
+    () => install({
+      ...options, force: true,
+      onInstallEvent({ phase }) {
+        if (phase === "after-skill-backup") throw new Error("injected rollback");
+      },
+    }),
+    /injected rollback/,
+  );
+  assert.equal(lstatSync(installedNotes).mode & 0o111, 0o111);
+  assert.deepEqual(readFileSync(installedNotes), priorContent);
+  assert.deepEqual(readFileSync(join(installedDir, ".knights-install.json")), priorManifest);
+
+  const interrupted = runHardExitSkillInstall({
+    projectRoot, home, phase: "after-skill-backup", force: true, exitCode: 94,
+  });
+  assert.equal(interrupted.status, 94, interrupted.stderr);
+  // No force: recovery restores the old install, then ordinary preflight refuses.
+  assert.throws(() => install(options), /already installed/i);
+  assert.equal(lstatSync(installedNotes).mode & 0o111, 0o111);
+  assert.deepEqual(readFileSync(installedNotes), priorContent);
+  install({ ...options, force: true });
+  assert.equal(lstatSync(installedNotes).mode & 0o111, 0o100);
+  assert.equal(readFileSync(installedNotes, "utf8"), "next version\n");
+  assert.deepEqual(listEntries(dirname(installedDir)), ["other-skill"]);
+});
+
+test("force updates accept older skill manifests without execute-bit metadata", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+  install(options);
+  const installedDir = join(home, ".claude/skills/other-skill");
+  const manifest = readManifest(installedDir);
+  for (const file of manifest.files) delete file.executeBits;
+  writeFileSync(join(installedDir, ".knights-install.json"), JSON.stringify(manifest));
+  chmodSync(join(sourceDir, "NOTES.md"), 0o755);
+  install({ ...options, force: true });
+  assert.equal(lstatSync(join(installedDir, "NOTES.md")).mode & 0o111, 0o111);
+});
+
+test("invalid execute-bit metadata fails closed before a force update", (t) => {
+  const projectRoot = withFixture(t);
+  createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+  install(options);
+  const installedDir = join(home, ".claude/skills/other-skill");
+  const manifest = readManifest(installedDir);
+  for (const executeBits of [null, "73", 0o4755, 0o644, -1, 1.5]) {
+    manifest.files[0].executeBits = executeBits;
+    const content = JSON.stringify(manifest);
+    writeFileSync(join(installedDir, ".knights-install.json"), content);
+    assert.throws(() => install({ ...options, force: true }), /invalid ownership manifest/i);
+    assert.equal(readFileSync(join(installedDir, ".knights-install.json"), "utf8"), content);
+  }
+  assert.deepEqual(listEntries(dirname(installedDir)), ["other-skill"]);
+});
+
+test("recovery preserves a skill backup with execute-bit drift until restored", (t) => {
+  const projectRoot = withFixture(t);
+  const sourceDir = createGenericSkillFixture(projectRoot, "other-skill");
+  const home = withHome(t);
+  const options = { projectRoot, home, skill: "other-skill", harnesses: ["claude"] };
+  install(options);
+  writeFileSync(join(sourceDir, "NOTES.md"), "next version\n");
+  const interrupted = runHardExitSkillInstall({
+    projectRoot, home, phase: "before-skill-backup-cleanup", force: true, exitCode: 95,
+  });
+  assert.equal(interrupted.status, 95, interrupted.stderr);
+  const parentDir = join(home, ".claude/skills");
+  const backup = listEntries(parentDir).find((name) => name.startsWith(".other-skill.knights-backup-"));
+  const backupNotes = join(parentDir, backup, "NOTES.md");
+  const priorContent = readFileSync(backupNotes);
+  chmodSync(backupNotes, 0o755);
+  assert.throws(() => install({ ...options, force: true }), /changed|drift/i);
+  assert.equal(lstatSync(backupNotes).mode & 0o111, 0o111);
+  assert.deepEqual(readFileSync(backupNotes), priorContent);
+  chmodSync(backupNotes, 0o644);
+  install({ ...options, force: true });
+  assert.deepEqual(listEntries(parentDir), ["other-skill"]);
 });
 
 test("refuses force when an owned install directory contains an untracked extra file", (t) => {
