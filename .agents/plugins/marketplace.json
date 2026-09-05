@@ -1,0 +1,17 @@
+{
+  "name": "knights-of-the-round-table",
+  "plugins": [
+    {
+      "name": "knights-of-the-round-table",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
