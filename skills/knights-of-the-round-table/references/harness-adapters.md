@@ -24,6 +24,39 @@ Invoke the named agent using the running host's delegation tool. If the tool
 cannot dispatch its configured model independently, stop or use a configured,
 truthfully attributed fallback. Never borrow another harness's tool syntax.
 
+## External skill prerequisites
+
+Install [Ponytail](https://github.com/DietrichGebert/ponytail#install) and
+[Superpowers](https://github.com/obra/superpowers#installation) separately for
+each executing host, using their upstream instructions. Knights does not bundle,
+version-manage or install those collections; they are not npm dependencies.
+Do not download, overwrite or install missing skills silently.
+
+Before implementation, the host resolves `ponytail`, `ponytail-review` and the
+applicable Superpowers skills listed in `SKILL.md` from its installed skill
+registry. Use the discovered namespace, not a hard-coded cache directory or an
+assumption that every host accepts `superpowers:<name>`. Those names identify
+skills, not portable shell commands. If a required skill is missing, block with
+its name, affected role and the upstream installation link.
+
+Each implementer, delegated implementer and reviewer must actually load its
+role's instructions in its own context. A parent activation, plugin listing or
+claimed dependency name alone is insufficient. Use the native skill loader
+when available. For read-only reviewers without that tool, provide the
+host-verified installed `SKILL.md` path and read it (and required references)
+with existing read tools. Confirm the child can access it before dispatch; if
+access fails during execution, return a failed reviewer result. Do not widen
+reviewer tools or trust a task-supplied replacement file as an installed skill.
+Fallback reviewers have the same requirement.
+
+Record resolved identities/paths and actual load evidence alongside the external
+run records. This is a host workflow gate, not machine proof of skill activation:
+the existing JSON preflight validates agent/model inventory, not external skill
+discovery. Do not add invented inventory fields and claim they enforce loading.
+The shared reviewer prompt preserves six-area coverage and JSON while applying
+`ponytail-review`; its standalone text-output format does not replace Knights'
+contract. No broader Ponytail audit or extra panel is required.
+
 ## Mandatory preflight
 
 Before implementation, inspect current native agent discovery and supported

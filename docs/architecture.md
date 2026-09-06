@@ -20,6 +20,8 @@ flowchart TD
     Skills --> Plugins["Host plugin skill discovery"]
     Agents --> NativeAgents["Claude and Copilot plugin agent discovery"]
     Homes --> Host["Coding host / operator"]
+    External["Separately installed Ponytail and Superpowers"] --> RoleLoad["Host resolves skills; each agent loads its role instructions"]
+    RoleLoad --> Host
     Plugins --> Host
     NativeAgents --> Host
     Config --> Effective["Dependency-free config loader"]
@@ -91,6 +93,15 @@ flowchart TD
 Every reviewer independently covers **correctness, tests, security,
 documentation, architecture and performance**. These are coverage dimensions,
 not six role-specific reviewers or a model-by-area matrix.
+
+Every implementer (including delegated repair agents) loads `ponytail` and
+applicable Superpowers pipeline skills. Every reviewer, including fallbacks,
+loads `ponytail-review` as an additional complexity pass without replacing
+six-area coverage or JSON output. These are separately installed external
+prerequisites, not npm dependencies or bundled copies. The host resolves native
+skill identities or installed files for read-only loading; missing access blocks
+the run. The Node inventory validator does not prove skill activation. See
+[dependency loading](../skills/knights-of-the-round-table/references/harness-adapters.md#external-skill-prerequisites).
 
 The default budget is 10 rounds, configurable to any positive safe integer.
 One monotonic counter covers both phases. A clean final round at the inclusive

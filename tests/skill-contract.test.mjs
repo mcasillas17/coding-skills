@@ -53,3 +53,34 @@ test("review budget defaults to 10 and permits 1 despite the two-phase workflow"
   assert.ok(/minimum of 1/.test(loop), "the configured cap permits a minimum of 1");
   assert.ok(/at least 2 rounds/.test(loop), "the two-phase workflow needs at least 2 rounds");
 });
+
+test("implementers load Ponytail and stage-appropriate Superpowers including in delegated contexts", () => {
+  const skill = read("SKILL.md");
+  assert.match(skill, /REQUIRED.*ponytail/);
+  assert.match(skill, /delegated implementer/i);
+  for (const name of ["using-superpowers", "brainstorming", "writing-plans",
+    "using-git-worktrees", "test-driven-development", "systematic-debugging",
+    "receiving-code-review", "requesting-code-review", "verification-before-completion",
+    "finishing-a-development-branch"]) assert.match(skill, new RegExp(`superpowers:${name}`));
+  assert.match(skill, /already.approved/i);
+});
+
+test("reviewers load Ponytail review without losing six-area coverage or the JSON contract", () => {
+  const prompt = read("reviewers/whole-panel.md");
+  assert.match(prompt, /REQUIRED.*ponytail-review/);
+  assert.match(prompt, /fallback/i);
+  assert.match(prompt, /additional.*complexity.*pass/i);
+  assert.match(prompt, /parent.*does not/i);
+  assert.match(prompt, /missing.*failed/i);
+  assert.match(prompt, /not.*Lean already\. Ship\./);
+  assert.match(prompt, /JSON/);
+});
+
+test("dependency guidance supports read-only loading without vendoring or silent installation", () => {
+  const adapters = read("references/harness-adapters.md");
+  for (const pattern of [/external skill prerequisites/i, /ponytail-review/, /superpowers/,
+    /SKILL\.md/, /read-only/, /discovered.*namespace/i, /do not.*download/i,
+    /missing.*block/i, /not.*machine.*proof/i, /DietrichGebert\/ponytail/, /obra\/superpowers/]) {
+    assert.match(adapters, pattern);
+  }
+});

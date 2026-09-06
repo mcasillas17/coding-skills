@@ -27,11 +27,22 @@ your repository. Installation does not grant model access or host permissions.
   version is claimed here.
 - A supported CLI with independent delegation, explicit model selection and
   read-only reviewer tools. See [support and limits](#support-and-limits).
+- [Ponytail](https://github.com/DietrichGebert/ponytail#install) and
+  [Superpowers](https://github.com/obra/superpowers#installation), installed
+  separately for each CLI you use. Implementers load `ponytail` and applicable
+  Superpowers stages; every reviewer loads `ponytail-review`.
 - For an actual delivery run: the target repository's validation tools,
   authenticated normal Git push, and a working GitHub PR interface.
 
 The source tooling uses the locked `yaml` dependency. Once installed, the bundled
 review/config runtime needs Node.js and Git, **not npm dependencies**.
+The external skills above are required workflow dependencies, not npm packages
+or vendored copies. The Knights installer does not install them or establish
+their availability. Follow their upstream installation instructions first;
+Knights blocks execution if a required skill cannot be loaded in its actual
+implementer/reviewer context. See
+[dependency loading](skills/knights-of-the-round-table/references/harness-adapters.md#external-skill-prerequisites)
+for native loaders, namespaces and read-only file loading.
 
 ### Standalone installation — all four CLIs
 
@@ -94,7 +105,8 @@ destinations; `--home` changes the install base, not the host's configuration.
 
 ### Plugin options
 
-Standalone installation is the complete setup path above. Plugin commands are
+Standalone installation sets up Knights and its reviewer definitions; the
+external skill prerequisites still apply. Plugin commands are
 host-specific; a discoverable skill alone is not a working reviewer panel.
 
 **Claude Code — load the local checkout as a plugin**
@@ -206,10 +218,15 @@ changes, releases, purchases or destructive operations.
 ### What a run does
 
 1. Read repository instructions, preserve existing dirty work, isolate a task
-   branch, normalize the task and verify reviewer capabilities.
-2. Implement and run relevant checks.
+   branch, normalize the task and verify reviewer capabilities and required
+   external skills in each execution context.
+2. Implement with Ponytail's reuse-first approach and applicable Superpowers
+   planning, TDD, debugging, feedback and verification stages. Delegated
+   implementers load the same role prerequisites.
 3. Dispatch **one independent reviewer per configured model**. Every reviewer
    covers correctness, tests, security, documentation, architecture and performance.
+   Each also loads `ponytail-review` for an additive complexity pass, preserving
+   the six-area review and JSON findings rather than Ponytail's standalone output.
 4. Merge findings without losing evidence, fix actionable feedback, record
    rejection/duplicate reasons, and repeat the full panel until clean.
 5. Update materially affected README/docs/diagrams/screenshots when useful.
