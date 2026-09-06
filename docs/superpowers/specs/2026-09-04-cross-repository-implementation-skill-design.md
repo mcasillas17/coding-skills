@@ -44,6 +44,15 @@ and strict result contract. The dependency-free skill-local runtime validates
 config, resolves identities/preflight, captures snapshots and evaluates rounds.
 The host executes the workflow; the helper does not launch models or publish.
 
+Implementers, including delegated repair agents, must load the separately
+installed `ponytail` skill and applicable Superpowers stages. Reviewers,
+including fallbacks and final rounds, must load `ponytail-review` as an additive
+complexity pass, retaining all six dimensions and the JSON result contract.
+Resolve dependencies through the host registry/loader or readable installed
+skill files in each agent context. Missing dependencies block; no silent
+installation, copied skill implementations or claimed parent-to-child activation.
+The runtime inventory validator does not establish skill-loading evidence.
+
 Generate read-only native reviewer definitions from source config and prompts.
 The source renderer synchronizes the Claude manifest's explicit Markdown file
 list. Copilot exposes its generated agent directory. Claude/Copilot plugin
