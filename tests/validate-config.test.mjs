@@ -31,6 +31,12 @@ test("config validates every boundary, rejecting instruction-bearing data and am
   }
   for (const value of [null, [], "config"]) assert.notEqual(validateConfig(value).length, 0);
 });
+test("default config has no round cap but a present cap is still validated", () => {
+  const value = config();
+  assert.equal(Object.hasOwn(value, "maxReviewRounds"), false);
+  value.maxReviewRounds = 0;
+  assert.notEqual(validateConfig(value).length, 0);
+});
 test("round cap has representability validation, not policy ceilings", () => {
   for (const value of [1, 10, 11, 50, Number.MAX_SAFE_INTEGER]) {
     assert.deepEqual(validateOverride({ maxReviewRounds: value }), []);

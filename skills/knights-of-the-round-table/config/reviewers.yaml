@@ -1,6 +1,5 @@
 version: 2
 strategy: whole_panel
-maxReviewRounds: 10
 reviewerRetryCount: 1
 documentationPolicy: impact-based
 taskSources:

@@ -35,7 +35,8 @@ export function evaluateRound(round, context) {
   const required = new Map(panel.map(entry => [entry.id, entry]));
   keys(round, ["version", "round", "phase", "configDigest", "snapshotDigest", "results"], "round");
   requireValue(round.version === 2, "round version must be 2");
-  requireValue(positive(round.round) && round.round <= context.config.maxReviewRounds, "round must be within configured maxReviewRounds");
+  const cap = context.config.maxReviewRounds ?? Infinity;
+  requireValue(positive(round.round) && round.round <= cap, "round must be within configured maxReviewRounds");
   requireValue(["implementation", "final"].includes(round.phase), "phase must be implementation or final");
   requireValue(round.configDigest === configDigest(context.config), "stale or mismatched config digest");
   requireValue(round.snapshotDigest === context.snapshot.digest, "stale or mismatched snapshot digest");
@@ -82,21 +83,26 @@ export function evaluateRound(round, context) {
     return { ...reports[0].finding, reportedBy: reports.map(r => r.reviewer).sort(cmp), reports };
   });
   const missingReviewers = panel.map(r => r.id).filter(id => !completed.has(id)).sort(cmp);
+  const clean = !actionable.length;
+  // At a user-set cap a complete panel publishes as-is; `actionable` lists what is still flagged.
   const state = missingReviewers.length ? "incomplete" :
-    !actionable.length ? "converged" :
-      round.round >= context.config.maxReviewRounds ? "limit-reached" : "actionable";
+    clean && round.phase === "final" ? "converged" :
+      round.round >= cap ? "limit-reached" :
+        clean ? "converged" : "actionable";
   return {
     state, actionable, missingReviewers,
     executions: executions.sort((a, b) => cmp(a.reviewer, b.reviewer)),
-    publicationReady: state === "converged" && round.phase === "final",
+    publicationReady: state === "limit-reached" || state === "converged" && round.phase === "final",
   };
 }
 
 const USAGE = `Usage:
   node scripts/review-round.mjs snapshot --repo <root> [--artifact <relative-file>]...
-  node scripts/review-round.mjs panel --repo <root> --harness <host> --mode <standalone|plugin> [--plugin-name <name>]
-  node scripts/review-round.mjs preflight <inventory.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>]
-  node scripts/review-round.mjs evaluate <round.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>] [--artifact <relative-file>]...
+  node scripts/review-round.mjs panel --repo <root> --harness <host> --mode <standalone|plugin> [--plugin-name <name>] [--max-rounds <n>]
+  node scripts/review-round.mjs preflight <inventory.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>] [--max-rounds <n>]
+  node scripts/review-round.mjs evaluate <round.json> --repo <root> --harness <host> --mode <mode> [--plugin-name <name>] [--max-rounds <n>] [--artifact <relative-file>]...
+--max-rounds is the cap the user gave at invocation; pass the same value to every command.
+Evaluate exits 0 converged, 2 actionable, 3 incomplete, 4 limit-reached, 1 invalid.
 JSON is emitted to stdout. Store reports/inventory outside the reviewed repository.
 Model availability, read-only isolation and actual execution require truthful host/operator attestation.`;
 export function runCli(args = process.argv.slice(2)) {
@@ -106,7 +112,7 @@ export function runCli(args = process.argv.slice(2)) {
     let input;
     if (["evaluate", "preflight"].includes(command)) input = rest.shift();
     requireValue(["snapshot", "panel", "preflight", "evaluate"].includes(command), USAGE);
-    const names = { "--repo": "repositoryRoot", "--harness": "harness", "--mode": "mode", "--plugin-name": "pluginName", "--artifact": "artifact" };
+    const names = { "--repo": "repositoryRoot", "--harness": "harness", "--mode": "mode", "--plugin-name": "pluginName", "--max-rounds": "maxReviewRounds", "--artifact": "artifact" };
     while (rest.length) {
       const flag = rest.shift(), value = rest.shift();
       requireValue(Object.hasOwn(names, flag) && text(value) && !value.startsWith("--"), USAGE);
@@ -115,18 +121,22 @@ export function runCli(args = process.argv.slice(2)) {
       else { requireValue(options[name] === undefined, `duplicate option: ${flag}`); options[name] = value; }
     }
     requireValue(text(options.repositoryRoot), "--repo is required");
+    if (options.maxReviewRounds !== undefined) {
+      requireValue(/^[1-9]\d*$/.test(options.maxReviewRounds), "--max-rounds must be a positive integer");
+      options.maxReviewRounds = Number(options.maxReviewRounds);
+    }
     if (command === "snapshot") { console.log(JSON.stringify(createSnapshot(options.repositoryRoot, options), null, 2)); return; }
     requireValue(text(options.harness) && text(options.mode), "--harness and --mode are required");
     const config = loadEffectiveConfig(options);
     let output;
-    if (command === "panel") output = { configDigest: configDigest(config), maxReviewRounds: config.maxReviewRounds, panel: resolvePanel(config, options.harness, options) };
+    if (command === "panel") output = { configDigest: configDigest(config), maxReviewRounds: config.maxReviewRounds ?? null, panel: resolvePanel(config, options.harness, options) };
     else {
       requireValue(text(input), USAGE);
       const document = JSON.parse(readFileSync(input, "utf8"));
       if (command === "preflight") output = preflight(config, options.harness, options, document);
       else {
         output = evaluateRound(document, { ...options, config, snapshot: createSnapshot(options.repositoryRoot, options) });
-        process.exitCode = output.state === "converged" ? 0 : output.state === "actionable" ? 2 : 3;
+        process.exitCode = { converged: 0, actionable: 2, incomplete: 3, "limit-reached": 4 }[output.state];
       }
     }
     console.log(JSON.stringify(output, null, 2));

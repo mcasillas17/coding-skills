@@ -2,14 +2,15 @@
 
 The implementation review converges first, then useful affected documentation is
 updated, then a final fresh full panel reviews the documented state. Keep one
-monotonic round counter across both phases. Default budget is 10; use the positive
-safe-integer repository-configured cap, with a minimum of 1. The cap is inclusive:
-a complete clean review on the last permitted round converges and, if final, may
-permit publication once all other gates pass. If that round remains actionable or
-incomplete, block without starting another round. Never reset the budget.
-The two-phase workflow needs at least 2 rounds; a cap of 1 is valid configuration
-but cannot complete both phases. Reserve budget for the required final review:
-a clean implementation review at the cap cannot skip it or start an extra round.
+monotonic round counter across both phases and never reset it.
+
+There is no round cap by default: repeat until the full panel returns no
+feedback. A cap exists only when the invoking user names one (`--max-rounds <n>`,
+passed identically to every command) or the repository sets `maxReviewRounds`;
+the invocation value wins. When the complete panel finishes round `n`, stop:
+publish that exact reviewed state, listing every finding still flagged, even if
+it was an implementation round and the final review never ran. Do not fix
+findings after the last round; the PR must match the reviewed snapshot.
 
 Each round runs ONE independent reviewer per configured primary model. Every
 reviewer examines all six dimensions, not a slice of the change. Capture the
@@ -51,13 +52,13 @@ panel must independently return no actionable feedback.
 
 | State | Meaning | Exit |
 | --- | --- | --- |
-| `converged` | full current panel complete; no findings; at or below cap | 0 |
-| `actionable` | feedback remains below cap | 2 |
+| `converged` | full current panel complete; no findings | 0 |
+| `actionable` | feedback remains; no cap or below it | 2 |
 | `incomplete` | configured reviewer missing, failed or skipped | 3 |
-| `limit-reached` | full current panel complete; actionable findings remain at configured cap | 3 |
-| schema/config/snapshot error | invalid or stale records; cannot evaluate | 1 |
+| `limit-reached` | full current panel complete at the user cap, not a clean final round; `actionable` lists what is still flagged (may be empty) | 4 |
+| schema/config/snapshot error | invalid or stale records, or a round past the cap | 1 |
 
-`publicationReady` is false for implementation rounds and every blocked state.
-It is true only for a converged `final` report. It is a machine gate, not proof of
-LLM execution, test success, completed docs or permission to publish. The host
-must also verify those workflow gates. No draft PR to bypass them.
+`publicationReady` is true for a converged `final` report and for `limit-reached`;
+false otherwise. It is a machine gate, not proof of LLM execution, test success,
+completed docs or permission to publish. The host must also verify those
+workflow gates. No draft PR to bypass them.

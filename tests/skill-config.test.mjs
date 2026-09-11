@@ -25,6 +25,13 @@ test("standalone installed copy loads defaults and repository overrides without 
   assert.equal(panel.status, 0, panel.stderr);
   assert.equal(JSON.parse(panel.stdout).panel.length, 2);
 });
+test("an invocation round cap replaces the repository cap and is validated", t => {
+  const f = fixture(t);
+  assert.equal(validator.loadEffectiveConfig(f).maxReviewRounds, undefined);
+  writeFileSync(f.override, "maxReviewRounds: 21\n");
+  assert.equal(validator.loadEffectiveConfig({ ...f, maxReviewRounds: 3 }).maxReviewRounds, 3);
+  assert.throws(() => validator.loadEffectiveConfig({ ...f, maxReviewRounds: 0 }), /maxReviewRounds/);
+});
 test("override and prompt links/directories/missing paths fail closed", t => {
   const f = fixture(t);
   for (const target of [join(f.directory, "missing"), join(f.skillRoot, "config/reviewers.yaml")]) {

@@ -29,8 +29,9 @@ then block. No silent cheaper-model substitution.
 ## Repository override
 
 The only optional override is `.knights-of-the-round-table.yaml` at repository
-root, loaded separately from task content. `maxReviewRounds` replaces the cap;
-each supplied `panels.<harness>` array REPLACES that harness's entire panel.
+root, loaded separately from task content. There is no default round cap;
+optional `maxReviewRounds` sets one, and a user's `--max-rounds` at invocation
+replaces it. Each supplied `panels.<harness>` array REPLACES that harness's entire panel.
 Omitted harnesses keep defaults. This permits adding, removing and remapping
 reviewers; no immutable six-reviewer floor, sixteen-panel cap, or lower-only cap.
 A panel must remain nonempty, with unique primary IDs and models. The shared
@@ -54,8 +55,8 @@ node "$SKILL_DIR/scripts/validate-config.mjs" "$REPOSITORY_ROOT"
 node "$SKILL_DIR/scripts/review-round.mjs" panel --repo "$REPOSITORY_ROOT" --harness copilot --mode plugin --plugin-name knights-of-the-round-table
 ```
 
-The panel command resolves plugin namespacing, reports the effective budget and
-config digest, and preserves local IDs separately from invocation IDs. Custom
+The panel command resolves plugin namespacing, reports the effective cap (`null`
+when uncapped) and config digest, and preserves local IDs separately from invocation IDs. Custom
 IDs/models must have matching host definitions or explicit host model controls:
 config alone does not install agents. The source renderer's `renderAgents(config,
 prompts)` API renders effective config; the normal installer installs the source

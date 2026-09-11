@@ -31,18 +31,23 @@ all of the following hold:
 1. Every configured model reviewer has independently covered all six dimensions, through its primary agent or a
    configured fallback (see `references/review-loop.md`).
 2. No actionable findings remain (`evaluateRound` reports `converged` and
-   `publicationReady: true` for a current final-phase snapshot within the inclusive cap).
+   `publicationReady: true` for a current final-phase snapshot), or the user's cap
+   was reached (`limit-reached`, `publicationReady: true` for the current snapshot).
 3. Final validation has been run against the last code or documentation change and
    passed.
-4. Impact-based documentation updates required by this change are already made.
+4. Impact-based documentation updates required by this change are already made,
+   unless the user's cap was reached first; then say so in the PR.
+
+There is no round cap by default. At a user cap, the PR carries the last reviewed
+state plus a "Still flagged" section listing every open finding with its reviewers,
+severity, location and recommendation. Tell the user the same list directly.
 
 ## Sequence
 
 1. Converge implementation review, then update materially affected documentation.
 2. Run final validation and a final fresh full-model-panel review of the documented
-   state. Keep the same round budget. A complete clean final review at the cap may
-   publish once all gates pass; actionable or incomplete results at the cap block
-   publication and any next round.
+   state on the same round counter. At a user cap, a complete panel publishes the
+   reviewed state with what is still flagged; an incomplete panel blocks.
 3. Re-evaluate the current state before staging only task-owned changes. Create
    focused commits describing the change; verify hooks did not change the content.
 4. Push the feature branch without force.
@@ -60,5 +65,7 @@ The rendered body, based on `assets/pr-body-template.md`, must include:
 - every accepted and fixed finding;
 - every intentionally rejected finding with its recorded evidence or reason;
 - documentation changed, including any diagrams or screenshots;
+- when the user's cap was reached: the cap, the phase reached, and every finding
+  still flagged; otherwise "None";
 - the pull request must never be opened as a substitute for finishing an
   incomplete round — an incomplete or blocked run has no pull request at all.
