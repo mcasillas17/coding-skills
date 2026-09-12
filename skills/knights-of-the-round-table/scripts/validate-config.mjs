@@ -67,7 +67,8 @@ export function validateConfig(config) {
   unknownKeys(config, KEYS, "configuration", errors);
   if (config.version !== 2) errors.push("version must be 2");
   if (config.strategy !== "whole_panel") errors.push("strategy must be whole_panel");
-  roundLimit(config.maxReviewRounds, errors);
+  // No cap by default: the panel runs until it returns no feedback.
+  if (Object.hasOwn(config, "maxReviewRounds")) roundLimit(config.maxReviewRounds, errors);
   if (config.reviewerRetryCount !== 1) errors.push("reviewerRetryCount must be exactly 1");
   if (config.documentationPolicy !== "impact-based") errors.push("documentationPolicy must be impact-based");
   if (!Array.isArray(config.taskSources) || config.taskSources.length !== 2 ||
@@ -143,7 +144,10 @@ export function loadEffectiveConfig(options = {}) {
   // A dangling link is not a missing override; lstat sees it and containedFile
   // rejects it rather than silently using defaults.
   const exists = lstatSync(resolve(repositoryRoot, override), { throwIfNoEntry: false });
-  return mergeConfig(config, exists ? parseFile(repositoryRoot, override) : {});
+  const effective = mergeConfig(config, exists ? parseFile(repositoryRoot, override) : {});
+  // A cap the user states when invoking the skill wins over the repository's.
+  if (options.maxReviewRounds === undefined) return effective;
+  return mergeConfig(effective, { maxReviewRounds: options.maxReviewRounds });
 }
 export function runCli(args = process.argv.slice(2)) {
   try {

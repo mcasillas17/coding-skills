@@ -42,39 +42,56 @@ test("implementation convergence is not publication readiness", () => {
   data.phase = "final";
   assert.equal(runtime.evaluateRound(data, ctx).publicationReady, true);
 });
+test("default config has no round cap: feedback keeps the loop going at any round", () => {
+  const ctx = context(), data = round(ctx, "final");
+  assert.equal(ctx.config.maxReviewRounds, undefined);
+  data.results[0].findings = [finding({})];
+  data.round = 1000;
+  const result = runtime.evaluateRound(data, ctx);
+  assert.equal(result.state, "actionable");
+  assert.equal(result.publicationReady, false);
+  data.results[0].findings = [];
+  assert.equal(runtime.evaluateRound(data, ctx).state, "converged");
+});
 for (const cap of [1, 2, 10]) {
+  test(`clean final round converges at user cap ${cap}`, () => {
+    const ctx = context(); ctx.config.maxReviewRounds = cap;
+    const data = round(ctx, "final"); data.round = cap;
+    const result = runtime.evaluateRound(data, ctx);
+    assert.equal(result.state, "converged");
+    assert.equal(result.publicationReady, true);
+  });
   for (const phase of ["implementation", "final"]) {
-    test(`clean ${phase} round ${cap} converges at inclusive cap ${cap}`, () => {
+    test(`complete ${phase} round at user cap ${cap} publishes with its unresolved findings`, () => {
       const ctx = context(); ctx.config.maxReviewRounds = cap;
       const data = round(ctx, phase); data.round = cap;
+      data.results[0].findings = [finding({})];
       const result = runtime.evaluateRound(data, ctx);
-      assert.equal(result.state, "converged");
-      assert.equal(result.publicationReady, phase === "final");
-      assert.deepEqual(result.actionable, []);
-      assert.deepEqual(result.missingReviewers, []);
+      assert.equal(result.state, "limit-reached");
+      assert.equal(result.publicationReady, true);
+      assert.equal(result.actionable.length, 1);
     });
   }
 }
-test("clean final round 11 is rejected with cap 10", () => {
-  const ctx = context(), data = round(ctx, "final");
-  assert.equal(ctx.config.maxReviewRounds, 10);
+test("clean implementation round at the user cap publishes without a final review", () => {
+  const ctx = context(); ctx.config.maxReviewRounds = 3;
+  const data = round(ctx); data.round = 3;
+  const result = runtime.evaluateRound(data, ctx);
+  assert.equal(result.state, "limit-reached");
+  assert.equal(result.publicationReady, true);
+  assert.deepEqual(result.actionable, []);
+});
+test("below the user cap feedback stays actionable, and rounds past it are rejected", () => {
+  const ctx = context(); ctx.config.maxReviewRounds = 10;
+  const data = round(ctx, "final");
+  data.results[0].findings = [finding({})];
+  data.round = 9;
+  assert.equal(runtime.evaluateRound(data, ctx).state, "actionable");
   data.round = 11;
   assert.throws(() => runtime.evaluateRound(data, ctx), /round must be within configured maxReviewRounds/);
 });
-test("actionable final round 10 reaches cap 10 rather than allowing another round", () => {
-  const ctx = context(), data = round(ctx, "final");
-  assert.equal(ctx.config.maxReviewRounds, 10);
-  data.results[0].findings = [finding({})];
-  for (const [number, state] of [[9, "actionable"], [10, "limit-reached"]]) {
-    data.round = number;
-    const result = runtime.evaluateRound(data, ctx);
-    assert.equal(result.state, state);
-    assert.equal(result.publicationReady, false);
-    assert.equal(result.actionable.length, 1);
-  }
-});
 test("missing, failed and skipped reviewers still block a clean final round at the cap", () => {
-  const ctx = context();
+  const ctx = context(); ctx.config.maxReviewRounds = 10;
   for (const status of ["missing", "failed", "skipped"]) {
     const data = round(ctx, "final"); data.round = ctx.config.maxReviewRounds;
     const reviewer = data.results[0].reviewer;
@@ -98,7 +115,7 @@ test("rejects stale snapshot, config, requested model, execution identity and in
     r => r.results[0].coverage.pop(),
     r => r.results[0].coverage.push("correctness"),
   ]) {
-    for (const number of [1, ctx.config.maxReviewRounds]) {
+    for (const number of [1, 10]) {
       const data = round(ctx, "final"); data.round = number; mutate(data);
       assert.throws(() => runtime.evaluateRound(data, ctx));
     }
@@ -263,12 +280,32 @@ test("snapshot propagates filesystem access errors instead of recording tracked 
     chmodSync(directory, 0o755);
   }
 });
-test("CLI accepts a clean final round at the cap but rejects its snapshot after changes", t => {
+const script = new URL("../skills/knights-of-the-round-table/scripts/review-round.mjs", import.meta.url).pathname;
+test("CLI --max-rounds caps the run, binds the config digest and exits 4 at the limit", t => {
   const { root } = repository(t);
-  const script = new URL("../skills/knights-of-the-round-table/scripts/review-round.mjs", import.meta.url).pathname;
+  const ctx = context(); ctx.snapshot = runtime.createSnapshot(root);
+  const out = mkdtempSync(join(tmpdir(), "knights-round-"));
+  t.after(() => rmSync(out, { recursive: true, force: true }));
+  const cli = (...args) => spawnSync(process.execPath, [script, ...args, "--repo", root, "--harness", "copilot", "--mode", "plugin", "--plugin-name", ctx.pluginName], { encoding: "utf8" });
+  assert.equal(JSON.parse(cli("panel").stdout).maxReviewRounds, null);
+  const panel = JSON.parse(cli("panel", "--max-rounds", "2").stdout);
+  assert.equal(panel.maxReviewRounds, 2);
+  const data = round(ctx); data.round = 2; data.configDigest = panel.configDigest;
+  data.results[0].findings = [finding({})];
+  writeFileSync(join(out, "round.json"), JSON.stringify(data));
+  const limited = cli("evaluate", join(out, "round.json"), "--max-rounds", "2");
+  assert.equal(limited.status, 4, limited.stderr);
+  assert.equal(JSON.parse(limited.stdout).publicationReady, true);
+  const uncapped = cli("evaluate", join(out, "round.json"));
+  assert.equal(uncapped.status, 1);
+  assert.match(uncapped.stderr, /config digest/);
+  for (const bad of ["0", "-1", "1.5", "1e3", "abc"]) assert.equal(cli("panel", "--max-rounds", bad).status, 1, bad);
+});
+test("CLI accepts a clean final round but rejects its snapshot after changes", t => {
+  const { root } = repository(t);
   const ctx = context(); ctx.snapshot = runtime.createSnapshot(root);
   const data = round(ctx, "final");
-  data.round = ctx.config.maxReviewRounds;
+  data.round = 50;
   const out = mkdtempSync(join(tmpdir(), "knights-round-"));
   t.after(() => rmSync(out, { recursive: true, force: true }));
   writeFileSync(join(out, "round.json"), JSON.stringify(data));

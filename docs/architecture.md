@@ -75,18 +75,17 @@ flowchart TD
     Panel --> Evaluate["Reload config, recapture snapshot, evaluate"]
     Evaluate --> Invalid{"Invalid or incomplete?"}
     Invalid -- Yes --> Recovery["Bounded retry / explicit fallback, otherwise blocked"]
-    Invalid -- No --> Findings{"Actionable findings?"}
-    Findings -- Yes --> Budget{"Another round available?"}
-    Budget -- No --> Block["Stop blocked; no PR"]
-    Budget -- Yes --> Fix["Triage transparently, fix, rerun checks"]
+    Invalid -- No --> Clean{"Clean final round?"}
+    Clean -- Yes --> Gate["publicationReady plus host-verified workflow gates"]
+    Clean -- No --> Cap{"User cap reached?"}
+    Cap -- Yes --> Flagged["No more edits; list still-flagged findings in PR and report"]
+    Flagged --> Gate
+    Cap -- No --> Findings{"Actionable findings?"}
+    Findings -- Yes --> Fix["Triage transparently, fix, rerun checks"]
     Fix --> Capture
-    Findings -- No --> Phase{"Final phase?"}
-    Phase -- No --> Docs["Update impacted docs and run final checks"]
-    Docs --> Reserve{"Budget for separate final review?"}
-    Reserve -- No --> Block
-    Reserve -- Yes --> Final["Set phase final; fresh documented-state review"]
+    Findings -- No --> Docs["Update impacted docs and run final checks"]
+    Docs --> Final["Set phase final; fresh documented-state review"]
     Final --> Capture
-    Phase -- Yes --> Gate["publicationReady plus host-verified workflow gates"]
     Gate --> Publish["Re-evaluate, stage task-owned files, commit, check hooks, push, PR"]
 ```
 
@@ -103,11 +102,12 @@ skill identities or installed files for read-only loading; missing access blocks
 the run. The Node inventory validator does not prove skill activation. See
 [dependency loading](../skills/knights-of-the-round-table/references/harness-adapters.md#external-skill-prerequisites).
 
-The default budget is 10 rounds, configurable to any positive safe integer.
-One monotonic counter covers both phases. A clean final round at the inclusive
-cap may publish if every other gate passes; actionable or incomplete feedback at
-the cap blocks. A cap of 1 is valid data but cannot complete the required two
-phases. Even when documentation impact requires no edits, final review is fresh.
+There is no round cap by default; review repeats until the panel has no
+feedback. One monotonic counter covers both phases. A cap comes only from the
+invoking user (`--max-rounds`) or the repository's `maxReviewRounds`. At the cap a
+complete panel yields `limit-reached`: the last reviewed state is published with
+its still flagged findings listed; an incomplete panel blocks. Even when
+documentation impact requires no edits, final review is fresh.
 
 Unexpected reviewer failures get one primary retry, then one configured fallback
 attempt, otherwise the run blocks. Preflight may select an explicit fallback
@@ -169,9 +169,10 @@ The implementer records evidence for rejection and explicit duplicate
 associations, then returns dispositions to the next panel. Every reported open
 finding remains actionable to the evaluator; deleting one is not triage.
 
-`evaluate` exits 0 for `converged`, 2 for `actionable`, 3 for `incomplete` or
+`evaluate` exits 0 for `converged`, 2 for `actionable`, 3 for `incomplete`, 4 for
 `limit-reached`, and 1 for validation errors. **Exit 0 alone is not permission to
-publish:** `publicationReady` is true only for a clean current `final` report.
+publish:** `publicationReady` is true only for a clean current `final` report or
+`limit-reached`.
 The host must additionally establish implementation-phase convergence, truthful
 execution/independence, completed documentation, passing final checks and
 publication authorization. The helper is stateless; it does not independently

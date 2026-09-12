@@ -235,9 +235,11 @@ changes, releases, purchases or destructive operations.
 7. Re-evaluate before staging task-owned changes, commit, check hooks did not
    alter reviewed content, push normally, and open the PR.
 
-The default round budget is **10**, shared across implementation and final
-reviews. The cap is inclusive: a clean final round at the cap can pass; an
-actionable or incomplete last round stops without a PR, including a draft.
+There is **no round cap** by default: the panel keeps reviewing until no
+reviewer has feedback. If you ask for a maximum ("max 3 rounds") when invoking
+the skill, the run stops after that many rounds and opens a PR of the last
+reviewed state, with a **Still flagged** section listing every unresolved
+finding, and reports the same list to you. An incomplete panel never opens a PR.
 Failures preserve work and report the blocker and recovery step, not success.
 
 ## Configure Knights
@@ -272,8 +274,8 @@ panels:
 Each supplied harness panel **replaces** that entire panel; omitted harnesses
 retain defaults. You may add, remove or remap entries. Panels must be nonempty
 with unique primary IDs and models. Every reviewer still covers all six areas.
-The budget accepts any positive safe integer, including 1, but the two-phase
-workflow needs at least **2 rounds** to finish. There is no fixed ten-round ceiling.
+`maxReviewRounds` is optional and accepts any positive safe integer; a cap given
+at invocation replaces it.
 
 Custom IDs/models need matching host agent definitions or supported model-control
 dispatch. Config does not install them; the normal installer installs source

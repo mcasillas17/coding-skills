@@ -16,6 +16,10 @@
 - Findings fixed: {{fixed_findings}}
 - Findings rejected: {{rejected_findings}}
 
+## Still flagged
+
+{{still_flagged}}
+
 ## Documentation
 
 {{documentation}}
