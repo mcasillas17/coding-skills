@@ -1,8 +1,8 @@
 ---
-name: "knights-astra"
+name: "knights-sol"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: [read, search]
-model: "gpt-6-astra"
+model: "gpt-6.1-sol"
 user-invocable: false
 ---
 

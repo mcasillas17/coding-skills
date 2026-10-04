@@ -2,7 +2,7 @@
 name: "knights-sonnet"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: Read, Grep, Glob
-model: "sonnet"
+model: "claude-sonnet-5-5"
 ---
 
 # Independent whole-panel reviewer

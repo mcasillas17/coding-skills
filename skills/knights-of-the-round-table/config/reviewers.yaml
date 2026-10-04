@@ -10,38 +10,41 @@ prompt: reviewers/whole-panel.md
 panels:
   copilot:
     - id: knights-grok
-      model: grok-4.6
+      model: grok-4.7
       fallback: null
     - id: knights-flash
       model: gemini-3.8-flash
       fallback: null
-    - id: knights-astra
-      model: gpt-6-astra
+    - id: knights-sol
+      model: gpt-6.1-sol
       fallback: null
     - id: knights-opus
-      model: claude-opus-4.8
+      model: claude-opus-5.5
       fallback: null
   claude:
     - id: knights-opus
-      model: claude-opus-5
+      model: claude-opus-5-5
       fallback: null
     - id: knights-sonnet
-      model: sonnet
+      model: claude-sonnet-5-5
       fallback: null
     - id: knights-haiku
-      model: haiku
+      model: claude-haiku-4-5
       fallback: null
   codex:
-    - id: knights-sol
-      model: gpt-5.6-sol
+    - id: knights-astra
+      model: gpt-6-astra
       fallback: null
-    - id: knights-terra
-      model: gpt-5.6-terra
+    - id: knights-sol
+      model: gpt-6.1-sol
+      fallback: null
+    - id: knights-gpt
+      model: gpt-5.5
       fallback: null
   gemini:
     - id: knights-flash
-      model: gemini-3.7-flash
+      model: gemini-3.8-flash
       fallback: null
     - id: knights-pro
-      model: gemini-3.1-pro
+      model: gemini-3.1-pro-preview
       fallback: null

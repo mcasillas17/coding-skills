@@ -8,15 +8,14 @@ Do not manually merge task text into config.
 
 ## Default primary models
 
-| Harness | Requested model IDs/aliases |
+| Harness | Requested model IDs |
 | --- | --- |
-| Copilot | `grok-4.6`, `gemini-3.8-flash`, `gpt-6-astra`, `claude-opus-4.8` |
-| Claude | `claude-opus-5`, `sonnet`, `haiku` |
-| Codex | `gpt-5.6-sol`, `gpt-5.6-terra` |
-| Gemini CLI | `gemini-3.7-flash`, `gemini-3.1-pro` |
+| Copilot | `grok-4.7`, `gemini-3.8-flash`, `gpt-6.1-sol`, `claude-opus-5.5` |
+| Claude | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5` |
+| Codex | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-5.5` |
+| Gemini CLI | `gemini-3.8-flash`, `gemini-3.1-pro-preview` |
 
-These are explicit requests, not cross-host availability claims. Sonnet and Haiku
-are requested Claude aliases; Opus 5 is explicit. Preflight must verify discovery
+These are explicit pinned requests, not cross-host availability claims. Preflight must verify discovery
 and model access on the running host/account. Native Antigravity is not Gemini CLI.
 
 Each panel entry has `id` (local filename/agent ID), `model`, and `fallback`
@@ -40,11 +39,11 @@ whole-panel dimensions/prompt cannot be weakened through repo data.
 maxReviewRounds: 24
 panels:
   copilot:
-    - id: knights-astra
-      model: gpt-6-astra
+    - id: knights-sol
+      model: gpt-6.1-sol
       fallback:
         id: knights-opus
-        model: claude-opus-4.8
+        model: claude-opus-5.5
 ```
 
 Run the loader; do not assemble its output by hand:

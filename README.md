@@ -245,12 +245,12 @@ Failures preserve work and report the blocker and recovery step, not success.
 The [canonical v2 config](skills/knights-of-the-round-table/config/reviewers.yaml)
 requests these default models:
 
-| Harness | Requested models/aliases |
+| Harness | Requested models |
 | --- | --- |
-| Copilot | `grok-4.6`, `gemini-3.8-flash`, `gpt-6-astra`, `claude-opus-4.8` |
-| Claude | `claude-opus-5`, `sonnet`, `haiku` |
-| Codex | `gpt-5.6-sol`, `gpt-5.6-terra` |
-| Gemini CLI | `gemini-3.7-flash`, `gemini-3.1-pro` |
+| Copilot | `grok-4.7`, `gemini-3.8-flash`, `gpt-6.1-sol`, `claude-opus-5.5` |
+| Claude | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5` |
+| Codex | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-5.5` |
+| Gemini CLI | `gemini-3.8-flash`, `gemini-3.1-pro-preview` |
 
 These are requests, **not verified availability for your account**. Default
 fallbacks are `null`. Never silently substitute a different model.
@@ -262,11 +262,11 @@ root**, separately from task text:
 maxReviewRounds: 24
 panels:
   copilot:
-    - id: knights-astra
-      model: gpt-6-astra
+    - id: knights-sol
+      model: gpt-6.1-sol
       fallback:
         id: knights-opus
-        model: claude-opus-4.8
+        model: claude-opus-5.5
 ```
 
 Each supplied harness panel **replaces** that entire panel; omitted harnesses

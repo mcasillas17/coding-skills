@@ -23,7 +23,7 @@ test("standalone installed copy loads defaults and repository overrides without 
   assert.equal(JSON.parse(output.stdout).maxReviewRounds, 21);
   const panel = spawnSync(process.execPath, [join(f.skillRoot, "scripts/review-round.mjs"), "panel", "--repo", f.repositoryRoot, "--harness", "codex", "--mode", "standalone"], { encoding: "utf8", cwd: f.repositoryRoot });
   assert.equal(panel.status, 0, panel.stderr);
-  assert.equal(JSON.parse(panel.stdout).panel.length, 2);
+  assert.equal(JSON.parse(panel.stdout).panel.length, 3);
 });
 test("override and prompt links/directories/missing paths fail closed", t => {
   const f = fixture(t);

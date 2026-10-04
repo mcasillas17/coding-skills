@@ -6,7 +6,7 @@ tools:
   - grep_search
   - glob
   - list_directory
-model: "gemini-3.1-pro"
+model: "gemini-3.1-pro-preview"
 ---
 
 # Independent whole-panel reviewer

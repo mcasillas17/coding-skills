@@ -14,7 +14,7 @@ The runtime `panel` command maps `id` (filename/local slot) to `invocationId`:
 | Copilot plugin | plugin-name + `:` + local ID, e.g. `knights-of-the-round-table:knights-opus` | Markdown `model`, `tools: [read, search]`, `user-invocable: false` |
 | Claude plugin | plugin-name + `:` + local ID | Markdown `model`, `tools: Read, Grep, Glob` |
 | Copilot / Claude standalone | bare local ID | same generated definition |
-| Codex, including plugin users | bare companion role ID, e.g. `knights-sol` | TOML `model`, `sandbox_mode = "read-only"`, `developer_instructions` |
+| Codex, including plugin users | bare companion role ID, e.g. `knights-astra` | TOML `model`, `sandbox_mode = "read-only"`, `developer_instructions` |
 | Gemini CLI standalone | bare local ID | Markdown `model`, read_file/grep_search/glob/list_directory tools |
 
 Supply the actual discovered plugin name with `--plugin-name`; do not prepend a
@@ -80,8 +80,9 @@ Example for Codex (populate availability only from real host evidence):
   "independent": true,
   "modelSelectionVerified": true,
   "agents": [
-    {"id": "knights-sol", "model": "gpt-5.6-sol", "available": true},
-    {"id": "knights-terra", "model": "gpt-5.6-terra", "available": true}
+    {"id": "knights-astra", "model": "gpt-6-astra", "available": true},
+    {"id": "knights-sol", "model": "gpt-6.1-sol", "available": true},
+    {"id": "knights-gpt", "model": "gpt-5.5", "available": true}
   ]
 }
 ```
