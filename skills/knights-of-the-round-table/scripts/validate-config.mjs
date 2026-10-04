@@ -8,7 +8,8 @@ export const HARNESSES = ["copilot", "claude", "codex", "gemini"];
 export const DIMENSIONS = ["correctness", "tests", "security", "documentation", "architecture", "performance"];
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/;
-const KEYS = ["version", "strategy", "maxReviewRounds", "reviewerRetryCount", "documentationPolicy", "taskSources", "prompt", "panels"];
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const KEYS = ["version", "strategy", "maxReviewRounds", "reasoningEffort", "reviewerRetryCount", "documentationPolicy", "taskSources", "prompt", "panels"];
 const mapping = value => value !== null && typeof value === "object" && !Array.isArray(value);
 
 function unknownKeys(value, keys, label, errors) {
@@ -69,6 +70,7 @@ export function validateConfig(config) {
   if (config.strategy !== "whole_panel") errors.push("strategy must be whole_panel");
   // No cap by default: the panel runs until it returns no feedback.
   if (Object.hasOwn(config, "maxReviewRounds")) roundLimit(config.maxReviewRounds, errors);
+  if (!EFFORTS.includes(config.reasoningEffort)) errors.push(`reasoningEffort must be one of ${EFFORTS.join(", ")}`);
   if (config.reviewerRetryCount !== 1) errors.push("reviewerRetryCount must be exactly 1");
   if (config.documentationPolicy !== "impact-based") errors.push("documentationPolicy must be impact-based");
   if (!Array.isArray(config.taskSources) || config.taskSources.length !== 2 ||

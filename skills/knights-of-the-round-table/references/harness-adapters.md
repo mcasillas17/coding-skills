@@ -11,11 +11,16 @@ The runtime `panel` command maps `id` (filename/local slot) to `invocationId`:
 
 | Host / distribution | Actual invocation identity | Native controls |
 | --- | --- | --- |
-| Copilot plugin | plugin-name + `:` + local ID, e.g. `knights-of-the-round-table:knights-opus` | Markdown `model`, `tools: [read, search]`, `user-invocable: false` |
-| Claude plugin | plugin-name + `:` + local ID | Markdown `model`, `tools: Read, Grep, Glob` |
+| Copilot plugin | plugin-name + `:` + local ID, e.g. `knights-of-the-round-table:knights-opus` | Markdown `model`, `tools: [read, search]`, `user-invocable: false`; no effort field |
+| Claude plugin | plugin-name + `:` + local ID | Markdown `model`, `effort`, `tools: Read, Grep, Glob` |
 | Copilot / Claude standalone | bare local ID | same generated definition |
-| Codex, including plugin users | bare companion role ID, e.g. `knights-astra` | TOML `model`, `sandbox_mode = "read-only"`, `developer_instructions` |
-| Gemini CLI standalone | bare local ID | Markdown `model`, read_file/grep_search/glob/list_directory tools |
+| Codex, including plugin users | bare companion role ID, e.g. `knights-astra` | TOML `model`, `model_reasoning_effort`, `sandbox_mode = "read-only"`, `developer_instructions` |
+| Gemini CLI standalone | bare local ID | Markdown `model`, read_file/grep_search/glob/list_directory tools; strict schema, no effort field |
+
+The panel reports each reviewer's requested `effort` (config `reasoningEffort`).
+Copilot agent profiles and Gemini CLI agents cannot pin it; their only per-agent
+effort settings live in user config, which Knights never edits. Request it
+through the dispatch tool when it offers that, otherwise record the host default.
 
 Supply the actual discovered plugin name with `--plugin-name`; do not prepend a
 namespace to filenames. `scripts/harness.mjs` performs this mapping, including

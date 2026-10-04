@@ -60,6 +60,7 @@ function skillYaml() {
   return YAML.stringify({
     version: 2,
     strategy: "whole_panel",
+    reasoningEffort: "high",
     maxReviewRounds: 10,
     reviewerRetryCount: 1,
     documentationPolicy: "impact-based",

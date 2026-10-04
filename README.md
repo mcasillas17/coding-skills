@@ -257,6 +257,11 @@ requests these default models:
 These are requests, **not verified availability for your account**. Default
 fallbacks are `null`. Never silently substitute a different model.
 
+Every reviewer requests **high reasoning effort** (`reasoningEffort: high`).
+Claude and Codex agents pin it in their definitions. Copilot and Gemini CLI agent
+files cannot, so the orchestrating agent requests it at dispatch when the host
+allows and otherwise records the host default. Knights never edits user config.
+
 Optionally create `.knights-of-the-round-table.yaml` at the **target repository
 root**, separately from task text:
 

@@ -18,6 +18,10 @@ Do not manually merge task text into config.
 These are explicit pinned requests, not cross-host availability claims. Preflight must verify discovery
 and model access on the running host/account. Native Antigravity is not Gemini CLI.
 
+Every reviewer requests `reasoningEffort: high` (one of `low`, `medium`, `high`,
+`xhigh`, `max`). It is part of the canonical config, not the repository override.
+Claude and Codex agents pin it natively; elsewhere it is a dispatch request.
+
 Each panel entry has `id` (local filename/agent ID), `model`, and `fallback`
 (`null` or an explicit `{id, model}` executor). All entries use the shared
 `prompt` and independently review all six dimensions. Fallbacks are separate
