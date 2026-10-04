@@ -32,3 +32,25 @@ test("a round cannot declare its own panel and certify convergence without indep
     results: [{ reviewer: "one", status: "completed", findings: [] }],
   }), /context|config|snapshot/i);
 });
+test("every reviewer requests high reasoning effort, natively where the agent format allows", async () => {
+  const value = config();
+  assert.equal(value.reasoningEffort, "high");
+  const { resolvePanel } = await import("../skills/knights-of-the-round-table/scripts/harness.mjs");
+  for (const harness of Object.keys(value.panels)) {
+    for (const reviewer of resolvePanel(value, harness)) assert.equal(reviewer.effort, "high");
+  }
+  const { renderAgents } = await import("../scripts/render-agents.mjs");
+  const rendered = renderAgents(value, { [value.prompt]: "Review." });
+  for (const file of Object.values(rendered.claude)) assert.match(file, /^effort: high$/m);
+  for (const file of Object.values(rendered.codex)) assert.match(file, /^model_reasoning_effort = "high"$/m);
+  // Copilot agent profiles and Gemini CLI's strict agent schema have no effort field.
+  for (const file of [...Object.values(rendered.copilot), ...Object.values(rendered.gemini)]) assert.doesNotMatch(file, /effort/);
+});
+test("reasoning effort must be a supported level and is not repository-overridable", () => {
+  for (const reasoningEffort of [undefined, "extreme", "", 3]) {
+    const value = { ...config(), reasoningEffort };
+    if (reasoningEffort === undefined) delete value.reasoningEffort;
+    assert.ok(validateConfig(value).includes("reasoningEffort must be one of low, medium, high, xhigh, max"), String(reasoningEffort));
+  }
+  assert.throws(() => mergeConfig(config(), { reasoningEffort: "low" }), /unknown key: reasoningEffort/);
+});

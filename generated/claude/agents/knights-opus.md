@@ -3,6 +3,7 @@ name: "knights-opus"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: Read, Grep, Glob
 model: "claude-opus-5-5"
+effort: high
 ---
 
 # Independent whole-panel reviewer

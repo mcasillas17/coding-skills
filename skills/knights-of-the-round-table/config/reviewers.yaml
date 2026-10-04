@@ -1,5 +1,6 @@
 version: 2
 strategy: whole_panel
+reasoningEffort: high
 reviewerRetryCount: 1
 documentationPolicy: impact-based
 taskSources:

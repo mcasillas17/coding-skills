@@ -46,15 +46,15 @@ function normalizePrompt(prompt) {
 }
 
 const renderers = {
-  claude: ({ name, model, description, prompt }) =>
+  claude: ({ name, model, effort, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
-    `tools: Read, Grep, Glob\nmodel: ${quote(model)}\n---\n\n${prompt}\n`,
+    `tools: Read, Grep, Glob\nmodel: ${quote(model)}\neffort: ${effort}\n---\n\n${prompt}\n`,
   copilot: ({ name, model, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
     `tools: [read, search]\nmodel: ${quote(model)}\nuser-invocable: false\n---\n\n${prompt}\n`,
-  codex: ({ name, model, description, prompt }) =>
+  codex: ({ name, model, effort, description, prompt }) =>
     `name = ${quote(name)}\ndescription = ${quote(description)}\n` +
-    `model = ${quote(model)}\nsandbox_mode = "read-only"\ndeveloper_instructions = ${quote(prompt)}\n`,
+    `model = ${quote(model)}\nmodel_reasoning_effort = ${quote(effort)}\nsandbox_mode = "read-only"\ndeveloper_instructions = ${quote(prompt)}\n`,
   gemini: ({ name, model, description, prompt }) =>
     `---\nname: ${quote(name)}\ndescription: ${quote(description)}\n` +
     "tools:\n  - read_file\n  - grep_search\n  - glob\n  - list_directory\n" +
@@ -165,6 +165,7 @@ export function renderAgents(config, prompts) {
         rendered[harness][filename] = renderers[harness]({
           name,
           model,
+          effort: config.reasoningEffort,
           description: REVIEWER_DESCRIPTION,
           prompt,
         });

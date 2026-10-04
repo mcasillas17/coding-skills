@@ -9,8 +9,8 @@ export function resolvePanel(config, harness, { mode = "standalone", pluginName 
   if (mode === "plugin" && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(pluginName ?? "")) throw new Error("plugin mode requires the discovered plugin-name");
   const invocation = id => mode === "plugin" && ["claude", "copilot"].includes(harness) ? `${pluginName}:${id}` : id;
   return config.panels[harness].map(entry => ({
-    id: entry.id, model: entry.model, invocationId: invocation(entry.id), coverage: [...DIMENSIONS],
-    fallback: entry.fallback ? { ...entry.fallback, invocationId: invocation(entry.fallback.id) } : null,
+    id: entry.id, model: entry.model, effort: config.reasoningEffort, invocationId: invocation(entry.id), coverage: [...DIMENSIONS],
+    fallback: entry.fallback ? { ...entry.fallback, effort: config.reasoningEffort, invocationId: invocation(entry.fallback.id) } : null,
   }));
 }
 

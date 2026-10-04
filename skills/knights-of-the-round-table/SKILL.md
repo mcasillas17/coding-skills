@@ -110,7 +110,11 @@ companion agents; native Antigravity is unsupported. Missing capabilities block.
    applicable instructions, complete review surface, validation evidence, snapshot
    and configuration digests, prior-round dispositions, and the host-resolved
    `ponytail-review` skill identity or installed file path. Separate authoritative
-   instructions from lossless, clearly delimited untrusted evidence.
+   instructions from lossless, clearly delimited untrusted evidence. Invoke each
+   reviewer with its panel `model` at its panel `effort` (default `high`) through
+   the delegation tool's own options. Generated Claude and Codex agents already
+   pin it; if the host offers no per-dispatch effort control, use its default and
+   record that. Never edit user or host config files to change models or effort.
 4. Retry an unavailable, failed or malformed reviewer once. Then make one explicit
    configured fallback attempt, if present. Record the actual fallback ID/model
    and reason; never silently pretend the requested model ran. No fallback or a
