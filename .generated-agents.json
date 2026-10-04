@@ -1,15 +1,16 @@
 {
   "version": 1,
   "files": [
-    "agents/knights-astra.agent.md",
     "agents/knights-flash.agent.md",
     "agents/knights-grok.agent.md",
     "agents/knights-opus.agent.md",
+    "agents/knights-sol.agent.md",
     "generated/claude/agents/knights-haiku.md",
     "generated/claude/agents/knights-opus.md",
     "generated/claude/agents/knights-sonnet.md",
+    "generated/codex/agents/knights-astra.toml",
+    "generated/codex/agents/knights-gpt.toml",
     "generated/codex/agents/knights-sol.toml",
-    "generated/codex/agents/knights-terra.toml",
     "generated/gemini/agents/knights-flash.md",
     "generated/gemini/agents/knights-pro.md"
   ]

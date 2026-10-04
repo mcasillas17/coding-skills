@@ -15,7 +15,7 @@ test("runtime invocation IDs distinguish plugin agents from local IDs and Codex 
     assert.equal(plugin[0].invocationId, `knights-of-the-round-table:${plugin[0].id}`);
     assert.equal(standalone[0].invocationId, standalone[0].id);
   }
-  assert.equal(resolvePanel(cfg, "codex", { mode: "plugin", pluginName: "knights-of-the-round-table" })[0].invocationId, "knights-sol");
+  assert.equal(resolvePanel(cfg, "codex", { mode: "plugin", pluginName: "knights-of-the-round-table" })[0].invocationId, "knights-astra");
   assert.throws(() => resolvePanel(cfg, "antigravity"), /unsupported/);
   assert.throws(() => resolvePanel(cfg, "gemini", { mode: "plugin", pluginName: "x" }), /standalone/);
   assert.throws(() => resolvePanel(cfg, "copilot", { mode: "plugin" }), /plugin-name/);
@@ -26,11 +26,11 @@ test("preflight blocks missing companions, unverified models, incorrect discover
     harness: "codex", ...opts, readOnly: true, independent: true, modelSelectionVerified: true,
     companionAgentsInstalled: true, agents: cfg.panels.codex.map(r => ({ id: r.id, model: r.model, available: true })),
   };
-  assert.equal(preflight(cfg, "codex", opts, inventory).length, 2);
+  assert.equal(preflight(cfg, "codex", opts, inventory).length, 3);
   for (const mutate of [
     i => i.companionAgentsInstalled = false, i => i.modelSelectionVerified = false,
     i => i.independent = false, i => i.readOnly = false, i => i.agents.pop(),
-    i => i.agents[0].model = "cheaper", i => i.agents[0].id = "wrong:knights-sol",
+    i => i.agents[0].model = "cheaper", i => i.agents[0].id = "wrong:knights-astra",
     i => i.mode = "standalone", i => i.harness = "gemini",
   ]) {
     const bad = structuredClone(inventory); mutate(bad);

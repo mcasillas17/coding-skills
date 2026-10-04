@@ -6,7 +6,7 @@ tools:
   - grep_search
   - glob
   - list_directory
-model: "gemini-3.7-flash"
+model: "gemini-3.8-flash"
 ---
 
 # Independent whole-panel reviewer

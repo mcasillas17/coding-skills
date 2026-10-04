@@ -2,7 +2,7 @@
 name: "knights-opus"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: [read, search]
-model: "claude-opus-4.8"
+model: "claude-opus-5.5"
 user-invocable: false
 ---
 

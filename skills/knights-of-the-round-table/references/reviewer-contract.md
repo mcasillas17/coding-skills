@@ -22,12 +22,12 @@ panel and `maxReviewRounds` are authoritative.
   "configDigest": "<digest emitted by panel command>",
   "snapshotDigest": "<digest emitted by snapshot command>",
   "results": [{
-    "reviewer": "knights-astra",
+    "reviewer": "knights-sol",
     "status": "completed",
-    "requestedModel": "gpt-6-astra",
+    "requestedModel": "gpt-6.1-sol",
     "execution": {
-      "id": "knights-of-the-round-table:knights-astra",
-      "model": "gpt-6-astra"
+      "id": "knights-of-the-round-table:knights-sol",
+      "model": "gpt-6.1-sol"
     },
     "snapshotDigest": "<same current snapshot digest>",
     "coverage": ["correctness", "tests", "security", "documentation", "architecture", "performance"],

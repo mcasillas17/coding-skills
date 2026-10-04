@@ -2,7 +2,7 @@
 name: "knights-grok"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: [read, search]
-model: "grok-4.6"
+model: "grok-4.7"
 user-invocable: false
 ---
 

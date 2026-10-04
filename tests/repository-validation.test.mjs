@@ -113,7 +113,7 @@ function assertClaudeManifest(root) {
     expected.map((path) => path.split("/").at(-1)));
 }
 
-const canonicalCounts = { claude: 3, copilot: 4, codex: 2, gemini: 2 };
+const canonicalCounts = { claude: 3, copilot: 4, codex: 3, gemini: 2 };
 const canonicalAgentCount = Object.values(canonicalCounts).reduce((a, b) => a + b, 0);
 
 function generatedSnapshot(root, encoding = "utf8") {
@@ -443,7 +443,7 @@ test("does not scan design plans, generated code, or substrings as prose placeho
 for (const [harness, path] of [
   ["Claude", "generated/claude/agents/knights-opus.md"],
   ["Copilot", "agents/knights-grok.agent.md"],
-  ["Codex", "generated/codex/agents/knights-sol.toml"],
+  ["Codex", "generated/codex/agents/knights-astra.toml"],
   ["Gemini", "generated/gemini/agents/knights-flash.md"],
 ]) {
   for (const missing of [true, false]) {
@@ -863,6 +863,6 @@ test("rejects stale changed harness mapping without changing generated artifacts
   const ownership = readFileSync(join(root, ".generated-agents.json"), "utf8");
   expectInvalid(root, /renamed-reviewer/);
   assert.equal(readFileSync(join(root, ".generated-agents.json"), "utf8"), ownership);
-  assert.equal(readFileSync(join(root, "generated/codex/agents/knights-sol.toml"), "utf8"),
-    readFileSync(join(projectRoot, "generated/codex/agents/knights-sol.toml"), "utf8"));
+  assert.equal(readFileSync(join(root, "generated/codex/agents/knights-astra.toml"), "utf8"),
+    readFileSync(join(projectRoot, "generated/codex/agents/knights-astra.toml"), "utf8"));
 });
