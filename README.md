@@ -250,8 +250,8 @@ requests these default models:
 | Harness | Requested models |
 | --- | --- |
 | Copilot | `grok-4.7`, `gemini-3.8-flash`, `gpt-6.1-sol`, `claude-opus-5.5` |
-| Claude | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5` |
-| Codex | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-5.5` |
+| Claude | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` |
+| Codex | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` |
 | Gemini CLI | `gemini-3.8-flash`, `gemini-3.1-pro-preview` |
 
 These are requests, **not verified availability for your account**. Default

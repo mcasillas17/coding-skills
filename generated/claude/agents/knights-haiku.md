@@ -2,7 +2,7 @@
 name: "knights-haiku"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: Read, Grep, Glob
-model: "claude-haiku-4-5"
+model: "claude-haiku-5-5"
 effort: high
 ---
 

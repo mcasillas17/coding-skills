@@ -87,7 +87,7 @@ Example for Codex (populate availability only from real host evidence):
   "agents": [
     {"id": "knights-astra", "model": "gpt-6-astra", "available": true},
     {"id": "knights-sol", "model": "gpt-6.1-sol", "available": true},
-    {"id": "knights-gpt", "model": "gpt-5.5", "available": true}
+    {"id": "knights-luna", "model": "gpt-6-luna", "available": true}
   ]
 }
 ```
