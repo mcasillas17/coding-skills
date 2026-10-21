@@ -29,7 +29,7 @@ panels:
       model: claude-sonnet-5-5
       fallback: null
     - id: knights-haiku
-      model: claude-haiku-4-5
+      model: claude-haiku-5-5
       fallback: null
   codex:
     - id: knights-astra
@@ -38,8 +38,8 @@ panels:
     - id: knights-sol
       model: gpt-6.1-sol
       fallback: null
-    - id: knights-gpt
-      model: gpt-5.5
+    - id: knights-luna
+      model: gpt-6-luna
       fallback: null
   gemini:
     - id: knights-flash
