@@ -1,8 +1,8 @@
 {
   "version": 1,
   "files": [
-    "agents/knights-flash.agent.md",
     "agents/knights-grok.agent.md",
+    "agents/knights-mai.agent.md",
     "agents/knights-opus.agent.md",
     "agents/knights-sol.agent.md",
     "generated/claude/agents/knights-haiku.md",
