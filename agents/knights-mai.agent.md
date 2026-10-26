@@ -1,8 +1,8 @@
 ---
-name: "knights-flash"
+name: "knights-mai"
 description: "Reviews correctness, tests, security, documentation, architecture, and performance without editing files."
 tools: [read, search]
-model: "gemini-3.8-flash"
+model: "mai-code-2-flash"
 user-invocable: false
 ---
 

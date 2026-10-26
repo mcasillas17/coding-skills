@@ -12,8 +12,8 @@ panels:
     - id: knights-grok
       model: grok-4.7
       fallback: null
-    - id: knights-flash
-      model: gemini-3.8-flash
+    - id: knights-mai
+      model: mai-code-2-flash
       fallback: null
     - id: knights-sol
       model: gpt-6.1-sol

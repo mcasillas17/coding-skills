@@ -10,7 +10,7 @@ test("defaults are precisely the requested model panels, not six inherited role 
   const value = config();
   assert.equal(value.strategy, "whole_panel");
   assert.deepEqual(Object.fromEntries(Object.entries(value.panels).map(([host, entries]) => [host, entries.map(e => e.model)])), {
-    copilot: ["grok-4.7", "gemini-3.8-flash", "gpt-6.1-sol", "claude-opus-5.5"],
+    copilot: ["grok-4.7", "mai-code-2-flash", "gpt-6.1-sol", "claude-opus-5.5"],
     claude: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
     codex: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"],
     gemini: ["gemini-3.8-flash", "gemini-3.1-pro-preview"],
